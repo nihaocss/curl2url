@@ -1,0 +1,13 @@
+# 编译中间产物
+*.new.exe
+MakeIcon.exe
+*.pdb
+
+# 编辑器 / VS
+.vs/
+bin/
+obj/
+
+# 本地测试数据（含抓包内容，不要提交）
+*.har
+test/
