@@ -4,9 +4,11 @@
 
 专治微信开发者工具 / Chrome 网络面板：右键只能复制 cURL，粘出来一堆 header、cookie、body；或者 HAR 文件太大没法看。两种都直接粘进来即可。
 
+还带一个**截图转文字**：报错截图直接 `Ctrl+V`，用 Windows 自带 OCR 在本机识别出文字，一键复制给 AI，不用再发图片。
+
 ## 下载安装
 
-- **Windows（推荐）**：直接下载 [curl2url.exe](https://github.com/nihaocss/curl2url/releases/latest/download/curl2url.exe)，免安装，双击运行。需要 .NET Framework 4.8（Windows 10 / 11 自带）。
+- **Windows（推荐）**：直接下载 [curl2url.exe](https://github.com/nihaocss/curl2url/releases/latest/download/curl2url.exe)，免安装，双击运行。需要 Windows 10 / 11（.NET Framework 4.8 自带）。截图识别用的是系统自带 OCR，中文 Windows 默认已装 `zh-Hans-CN` 语言包，无需联网。
 - **macOS / Linux**：没有 GUI 安装包，可安装 Node.js 后使用仓库里的 `curl2url.js` 命令行。
 - **iOS / Android**：不支持。本项目是 Windows 桌面工具，没有移动端版本。
 
@@ -26,11 +28,13 @@
 
 - 打开时如果剪贴板里是 cURL 或 HAR，会自动载入
 - **粘贴后自动解析**，不需要点按钮；`Ctrl+Enter` 可立即刷新
-- 界面四个页签：
+- 界面五个页签：
   - **URL**：提取出的地址（勾选「隐藏长参数 / Token」时，token 会打码）
   - **请求详情**：每个请求的 URL、方法、状态、查询参数、请求头、请求体（JSON 自动格式化）
   - **失败请求**：HAR 里状态码 ≥ 400、被拦截或无响应的请求，保留 URL、请求参数、响应头和响应体
   - **响应**：仍可手动粘贴单条返回值，一键格式化 JSON
+  - **截图识别**：微信 / QQ 截图后直接 `Ctrl+V`（或点「粘贴图片」「打开图片」，也可以把图片文件拖进窗口），自动识别报错文字；识别结果可一键复制给 AI
+- 截图识别完全在本机完成，不上传图片；小字号截图会自动放大后再识别。中文 OCR 引擎本身也能识别英文报错，纯英文行会把误判的全角标点转回半角（`https：//` → `https://`）；个别字母可能混淆（`l` / `1`、`O` / `0`），贴给 AI 前扫一眼即可
 - HAR 支持：点「打开 HAR 文件」、把 `.har` 文件拖进窗口，或直接粘贴 JSON
 - 默认按 URL 去重；支持 `http://`、`https://`、`ws://`、`wss://`
 - 默认隐藏超长参数值和 token / sign / session / cookie / authorization 一类字段
@@ -64,6 +68,9 @@ Get-Content curl.txt | .\curl2url.exe --details --mask
 
 # 只看失败请求（需要 HAR 或带 statusCode 的请求列表 JSON，cURL 不含响应状态）
 Get-Content network.har | .\curl2url.exe --failures --mask
+
+# 截图转文字（Windows 自带 OCR，识别结果打印到标准输出）
+.\curl2url.exe --ocr error.png
 
 # 自检（不会弹窗口）
 .\curl2url.exe --selftest

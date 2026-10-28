@@ -1,14 +1,27 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+
+[assembly: System.Reflection.AssemblyTitle("curl2url")]
+[assembly: System.Reflection.AssemblyDescription("cURL / HAR 解析与失败请求查看工具")]
+[assembly: System.Reflection.AssemblyProduct("curl2url")]
+[assembly: System.Reflection.AssemblyCompany("lizhuoyu")]
+[assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 lizhuoyu")]
+[assembly: System.Reflection.AssemblyVersion("1.0.4.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.4.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.4")]
 
 namespace Curl2Url
 {
@@ -34,6 +47,15 @@ namespace Curl2Url
                     RunFailuresOnly();
                     return;
                 }
+                if (args[0] == "--ocr")
+                {
+                    if (args.Length < 2)
+                    {
+                        WriteStderr("用法：curl2url.exe --ocr <图片路径>");
+                        Environment.Exit(2);
+                    }
+                    Environment.Exit(RunOcrOnly(args[1]));
+                }
                 if (args[0] == "--selftest")
                 {
                     Application.EnableVisualStyles();
@@ -41,6 +63,17 @@ namespace Curl2Url
                     using (MainForm form = new MainForm())
                     {
                         form.CreateControl();
+                    }
+                    if (OcrRunner.NormalizeOcrText("系 统 繁 忙 ， 请 稍 后 重 试") != "系统繁忙，请稍后重试")
+                    {
+                        Console.WriteLine("OCR normalize failed");
+                        Environment.Exit(1);
+                    }
+                    // 纯英文行把误识别的全角冒号转回半角，并去掉标点前空格
+                    if (OcrRunner.NormalizeOcrText("GET https ：//api.example.com/v1") != "GET https://api.example.com/v1")
+                    {
+                        Console.WriteLine("OCR latin normalize failed");
+                        Environment.Exit(1);
                     }
                     Console.WriteLine("OK");
                     Environment.Exit(0);
@@ -84,6 +117,31 @@ namespace Curl2Url
                 if (string.Equals(arg, name, StringComparison.OrdinalIgnoreCase)) return true;
             }
             return false;
+        }
+
+        private static int RunOcrOnly(string path)
+        {
+            try
+            {
+                using (Image image = Image.FromFile(path))
+                using (Bitmap bitmap = new Bitmap(image))
+                {
+                    string text;
+                    string error;
+                    if (!OcrRunner.TryRecognize(bitmap, out text, out error))
+                    {
+                        WriteStderr("OCR 失败：" + error);
+                        return 1;
+                    }
+                    WriteStdout(text + "\r\n");
+                    return 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteStderr("OCR 失败：" + ex.Message);
+                return 1;
+            }
         }
 
         private static void RunExtractOnly()
@@ -172,6 +230,14 @@ namespace Curl2Url
         private readonly System.Windows.Forms.Timer _autoTimer;
         private TabPage _failurePage;
         private string _lastSignature = "";
+
+        // 截图识别页签
+        private TabControl _tabs;
+        private TabPage _ocrPage;
+        private PictureBox _ocrPreview;
+        private TextBox _ocrBox;
+        private Label _ocrStatusLabel;
+        private bool _ocrBusy;
 
         public MainForm()
         {
@@ -277,6 +343,9 @@ namespace Curl2Url
             Button openButton = MakeButton("打开 HAR 文件", false, 112);
             openButton.Click += delegate { OpenHarFile(); };
 
+            Button ocrButton = MakeButton("截图识别", false, 88);
+            ocrButton.Click += delegate { ShowOcrPage(true); };
+
             Button copyButton = MakeButton("复制 URL 列表", false, 112);
             copyButton.Click += delegate { CopyResult(); };
 
@@ -301,13 +370,14 @@ namespace Curl2Url
             _maskSensitive.CheckedChanged += delegate { Analyze(false); };
 
             Label hint = new Label();
-            hint.Text = "粘贴或拖入后自动解析，Ctrl+Enter 立即刷新；结果框支持右键全选复制";
+            hint.Text = "粘贴或拖入后自动解析，Ctrl+Enter 刷新；报错截图可直接 Ctrl+V 转文字";
             hint.ForeColor = MutedColor;
             hint.AutoSize = true;
             hint.Margin = new Padding(6, 9, 0, 0);
 
             buttons.Controls.Add(pasteButton);
             buttons.Controls.Add(openButton);
+            buttons.Controls.Add(ocrButton);
             buttons.Controls.Add(copyButton);
             buttons.Controls.Add(clearButton);
             buttons.Controls.Add(_keepDuplicates);
@@ -439,10 +509,14 @@ namespace Curl2Url
 
             responsePage.Controls.Add(responseLayout);
 
+            _tabs = tabs;
+            _ocrPage = BuildOcrPage();
+
             tabs.TabPages.Add(urlPage);
             tabs.TabPages.Add(detailPage);
             tabs.TabPages.Add(_failurePage);
             tabs.TabPages.Add(responsePage);
+            tabs.TabPages.Add(_ocrPage);
             root.Controls.Add(tabs, 0, 4);
 
             _statusLabel = new Label();
@@ -513,6 +587,106 @@ namespace Curl2Url
             return button;
         }
 
+        private TabPage BuildOcrPage()
+        {
+            TabPage page = new TabPage("截图识别");
+            page.BackColor = Color.White;
+            page.UseVisualStyleBackColor = false;
+            page.Padding = new Padding(8);
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.ColumnCount = 1;
+            layout.RowCount = 4;
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            Label hint = new Label();
+            hint.Text = "微信 / QQ 截图后直接 Ctrl+V（中英文均可），或点「粘贴图片」「打开图片」；识别结果可一键复制给 AI。";
+            hint.ForeColor = MutedColor;
+            hint.AutoSize = false;
+            hint.Height = 34;
+            hint.Dock = DockStyle.Fill;
+            hint.Margin = new Padding(0, 0, 0, 6);
+            layout.Controls.Add(hint, 0, 0);
+
+            FlowLayoutPanel buttons = new FlowLayoutPanel();
+            buttons.FlowDirection = FlowDirection.LeftToRight;
+            buttons.WrapContents = false;
+            buttons.AutoSize = true;
+            buttons.Dock = DockStyle.Fill;
+            buttons.Margin = new Padding(0, 0, 0, 4);
+
+            Button pasteImageButton = MakeSmallButton("粘贴图片", 96);
+            pasteImageButton.Click += delegate { PasteImageFromClipboard(); };
+
+            Button openImageButton = MakeSmallButton("打开图片", 96);
+            openImageButton.Click += delegate { OpenImageFile(); };
+
+            Button copyTextButton = MakeSmallButton("复制文字", 84);
+            copyTextButton.Click += delegate { CopyOcrText(); };
+
+            Button clearButton = MakeSmallButton("清空", 64);
+            clearButton.Click += delegate { ClearOcr(); };
+
+            buttons.Controls.Add(pasteImageButton);
+            buttons.Controls.Add(openImageButton);
+            buttons.Controls.Add(copyTextButton);
+            buttons.Controls.Add(clearButton);
+            layout.Controls.Add(buttons, 0, 1);
+
+            _ocrStatusLabel = new Label();
+            _ocrStatusLabel.Text = "等待图片。支持中英文截图，识别在本机完成，不会上传。";
+            _ocrStatusLabel.ForeColor = MutedColor;
+            _ocrStatusLabel.AutoSize = false;
+            _ocrStatusLabel.Height = 22;
+            _ocrStatusLabel.Dock = DockStyle.Fill;
+            _ocrStatusLabel.AutoEllipsis = true;
+            _ocrStatusLabel.Margin = new Padding(0, 0, 0, 6);
+            layout.Controls.Add(_ocrStatusLabel, 0, 2);
+
+            TableLayoutPanel content = new TableLayoutPanel();
+            content.Dock = DockStyle.Fill;
+            content.ColumnCount = 2;
+            content.RowCount = 1;
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32F));
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68F));
+            content.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            content.Margin = new Padding(0);
+
+            _ocrPreview = new PictureBox();
+            _ocrPreview.Dock = DockStyle.Fill;
+            _ocrPreview.SizeMode = PictureBoxSizeMode.Zoom;
+            _ocrPreview.BackColor = Color.FromArgb(250, 251, 252);
+            _ocrPreview.BorderStyle = BorderStyle.FixedSingle;
+            _ocrPreview.Margin = new Padding(0, 0, 8, 0);
+            _ocrPreview.AllowDrop = true;
+            _ocrPreview.DragEnter += HandleDragEnter;
+            _ocrPreview.DragDrop += HandleDragDrop;
+            content.Controls.Add(_ocrPreview, 0, 0);
+
+            _ocrBox = new TextBox();
+            _ocrBox.Multiline = true;
+            _ocrBox.ReadOnly = true;
+            _ocrBox.WordWrap = true;
+            _ocrBox.ScrollBars = ScrollBars.Vertical;
+            _ocrBox.Font = new Font("Consolas", 10F);
+            _ocrBox.BackColor = Color.White;
+            _ocrBox.ForeColor = TitleColor;
+            _ocrBox.BorderStyle = BorderStyle.FixedSingle;
+            _ocrBox.Dock = DockStyle.Fill;
+            _ocrBox.Margin = new Padding(0);
+            AttachOutputMenu(_ocrBox, false);
+            content.Controls.Add(_ocrBox, 1, 0);
+
+            layout.Controls.Add(content, 0, 3);
+            page.Controls.Add(layout);
+            return page;
+        }
+
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (keyData == (Keys.Control | Keys.Enter))
@@ -520,6 +694,41 @@ namespace Curl2Url
                 _autoTimer.Stop();
                 Analyze(false);
                 return true;
+            }
+
+            // 剪贴板里是图片（例如微信截图）时，Ctrl+V 直接走 OCR；
+            // 图片和文字同时存在时，只有在「截图识别」页签内才优先识别图片。
+            if (keyData == (Keys.Control | Keys.V) && _ocrPage != null)
+            {
+                bool ocrTabActive = _tabs != null && _tabs.SelectedTab == _ocrPage;
+                bool hasImage = false;
+                try
+                {
+                    hasImage = Clipboard.ContainsImage();
+                    if (hasImage && !ocrTabActive && Clipboard.ContainsText()) hasImage = false;
+                }
+                catch (ExternalException)
+                {
+                    // 剪贴板被其他程序占用，交给默认粘贴处理
+                }
+                catch (Exception)
+                {
+                }
+
+                if (hasImage)
+                {
+                    Bitmap image = TryGetClipboardImage();
+                    if (image != null)
+                    {
+                        StartOcr(image, "剪贴板图片");
+                        return true;
+                    }
+                }
+                else if (ocrTabActive)
+                {
+                    SetOcrStatus("剪贴板里没有图片。请先截图，再按 Ctrl+V 或点「粘贴图片」。", ErrorColor);
+                    return true;
+                }
             }
 
             // 结果框是只读的，这里显式兜底 Ctrl+A / Ctrl+C，避免个别环境里快捷键失效
@@ -543,6 +752,7 @@ namespace Curl2Url
             if (_resultBox != null && _resultBox.Focused) return _resultBox;
             if (_detailBox != null && _detailBox.Focused) return _detailBox;
             if (_failureBox != null && _failureBox.Focused) return _failureBox;
+            if (_ocrBox != null && _ocrBox.Focused) return _ocrBox;
             return null;
         }
 
@@ -598,6 +808,22 @@ namespace Curl2Url
                     string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
                     if (files != null && files.Length > 0)
                     {
+                        if (IsImageFile(files[0]))
+                        {
+                            try
+                            {
+                                using (Image image = Image.FromFile(files[0]))
+                                {
+                                    StartOcr(new Bitmap(image), Path.GetFileName(files[0]));
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                SetOcrStatus("打开图片失败：" + ex.Message, ErrorColor);
+                            }
+                            return;
+                        }
+
                         _inputBox.Text = File.ReadAllText(files[0], Encoding.UTF8);
                         SetStatus("已读取 " + Path.GetFileName(files[0]) + "，自动解析中…", MutedColor);
                     }
@@ -804,6 +1030,210 @@ namespace Curl2Url
                     SetStatus("读取文件失败：" + ex.Message, ErrorColor);
                 }
             }
+        }
+
+        private void ShowOcrPage(bool tryClipboardImage)
+        {
+            if (_tabs != null && _ocrPage != null) _tabs.SelectedTab = _ocrPage;
+            if (!tryClipboardImage) return;
+
+            if (_ocrBusy)
+            {
+                SetOcrStatus("正在识别上一张图片，请稍候。", MutedColor);
+                return;
+            }
+
+            Bitmap image = TryGetClipboardImage();
+            if (image != null)
+            {
+                StartOcr(image, "剪贴板图片");
+                return;
+            }
+            SetOcrStatus("剪贴板里没有图片。截图后按 Ctrl+V，或点「打开图片」。", MutedColor);
+        }
+
+        private void PasteImageFromClipboard()
+        {
+            if (_ocrBusy)
+            {
+                SetOcrStatus("正在识别上一张图片，请稍候。", MutedColor);
+                return;
+            }
+
+            Bitmap image = TryGetClipboardImage();
+            if (image == null)
+            {
+                SetOcrStatus("剪贴板里没有图片。请先截图（微信 / QQ 截图会直接放进剪贴板）。", ErrorColor);
+                return;
+            }
+            StartOcr(image, "剪贴板图片");
+        }
+
+        private void OpenImageFile()
+        {
+            if (_ocrBusy)
+            {
+                SetOcrStatus("正在识别上一张图片，请稍候。", MutedColor);
+                return;
+            }
+
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "打开截图";
+                dialog.Filter = "图片 (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff)|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff|所有文件 (*.*)|*.*";
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+                try
+                {
+                    using (Image image = Image.FromFile(dialog.FileName))
+                    {
+                        StartOcr(new Bitmap(image), Path.GetFileName(dialog.FileName));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SetOcrStatus("打开图片失败：" + ex.Message, ErrorColor);
+                }
+            }
+        }
+
+        private static bool IsImageFile(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            string extension = Path.GetExtension(path);
+            if (string.IsNullOrEmpty(extension)) return false;
+            extension = extension.ToLowerInvariant();
+            return extension == ".png" || extension == ".jpg" || extension == ".jpeg" ||
+                   extension == ".bmp" || extension == ".gif" ||
+                   extension == ".tif" || extension == ".tiff";
+        }
+
+        private static Bitmap TryGetClipboardImage()
+        {
+            try
+            {
+                if (!Clipboard.ContainsImage()) return null;
+                using (Image image = Clipboard.GetImage())
+                {
+                    if (image == null) return null;
+                    // 剪贴板内容随时可能失效，先复制成独立位图再慢速识别
+                    return new Bitmap(image);
+                }
+            }
+            catch (ExternalException)
+            {
+                return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private void StartOcr(Bitmap bitmap, string sourceLabel)
+        {
+            if (bitmap == null) return;
+            if (_ocrPreview == null || _ocrBox == null)
+            {
+                bitmap.Dispose();
+                return;
+            }
+            if (_ocrBusy)
+            {
+                bitmap.Dispose();
+                SetOcrStatus("正在识别上一张图片，请稍候。", MutedColor);
+                return;
+            }
+
+            if (_tabs != null && _ocrPage != null) _tabs.SelectedTab = _ocrPage;
+            _ocrBusy = true;
+
+            Image previous = _ocrPreview.Image;
+            _ocrPreview.Image = bitmap;
+            if (previous != null) previous.Dispose();
+
+            _ocrBox.Text = "";
+            SetOcrStatus("正在识别图片文字…（大截图可能需要几秒）", MutedColor);
+
+            // OCR 比较慢，放到后台线程，界面不卡顿；工作线程用独立副本
+            Bitmap work = new Bitmap(bitmap);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string text;
+                string error;
+                bool ok = OcrRunner.TryRecognize(work, out text, out error);
+                work.Dispose();
+
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        _ocrBusy = false;
+                        if (!ok)
+                        {
+                            _ocrBox.Text = "";
+                            SetOcrStatus("识别失败：" + error, ErrorColor);
+                            return;
+                        }
+                        if (string.IsNullOrWhiteSpace(text))
+                        {
+                            _ocrBox.Text = "";
+                            SetOcrStatus("没有识别出文字。换一张更清晰、文字更大的截图试试。", ErrorColor);
+                            return;
+                        }
+
+                        _ocrBox.Text = text;
+                        SetOcrStatus(
+                            string.Format("识别完成：{0}（{1} 个字符），可直接复制给 AI。", sourceLabel, text.Length),
+                            OkColor);
+                    }));
+                }
+                catch (InvalidOperationException)
+                {
+                    // 窗口已关闭
+                }
+            });
+        }
+
+        private void CopyOcrText()
+        {
+            if (string.IsNullOrWhiteSpace(_ocrBox.Text))
+            {
+                SetOcrStatus("还没有识别结果可复制。", ErrorColor);
+                return;
+            }
+
+            try
+            {
+                SetClipboardText(_ocrBox.Text);
+                SetOcrStatus("识别文字已复制到剪贴板。", OkColor);
+            }
+            catch (Exception ex)
+            {
+                SetOcrStatus(ex.Message, ErrorColor);
+            }
+        }
+
+        private void ClearOcr()
+        {
+            if (_ocrBusy)
+            {
+                SetOcrStatus("正在识别，完成后再清空。", MutedColor);
+                return;
+            }
+
+            _ocrBox.Text = "";
+            Image previous = _ocrPreview.Image;
+            _ocrPreview.Image = null;
+            if (previous != null) previous.Dispose();
+            SetOcrStatus("等待图片。支持中英文截图，识别在本机完成，不会上传。", MutedColor);
+        }
+
+        private void SetOcrStatus(string text, Color color)
+        {
+            if (_ocrStatusLabel == null) return;
+            _ocrStatusLabel.Text = text;
+            _ocrStatusLabel.ForeColor = color;
         }
 
         private void CopyResult()
@@ -1074,6 +1504,302 @@ namespace Curl2Url
             if (string.IsNullOrEmpty(Url)) return false;
             return Url.StartsWith("ws://", StringComparison.OrdinalIgnoreCase) ||
                    Url.StartsWith("wss://", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    // 调用 Windows 自带的 OCR 引擎（Windows.Media.Ocr），在本机完成，不需要联网，也不用装额外组件。
+    // 通过 PowerShell 5.1 的 WinRT 投影调用，避免额外依赖 Windows SDK / Windows.winmd。
+    internal static class OcrRunner
+    {
+        private const int MaxScaledDimension = 9000;
+        private const long MaxScaledPixels = 40000000L;
+        private const int TimeoutMilliseconds = 60000;
+
+        private static readonly Regex HanPattern =
+            new Regex(@"[㐀-䶿一-鿿]", RegexOptions.Compiled);
+
+        private const string OcrScript = @"$ErrorActionPreference = 'Stop'
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation?1' })
+    function Await($WinRtTask, $ResultType) {
+        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(-1) | Out-Null
+        $netTask.Result
+    }
+    [Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Media.Ocr.OcrEngine,Windows.Media,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Globalization.Language,Windows.Globalization,ContentType=WindowsRuntime] | Out-Null
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    if ($null -eq $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('zh-Hans-CN')) }
+    if ($null -eq $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US')) }
+    if ($null -eq $engine) { throw '本机没有可用的 Windows OCR 语言包（设置 → 时间和语言 → 语言 → 添加中文/英文语言包）' }
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:CURL2URL_OCR_IMG)) ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    $lines = @($result.Lines | ForEach-Object { $_.Text })
+    [System.IO.File]::WriteAllText($env:CURL2URL_OCR_OUT, ($lines -join [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+}
+catch {
+    $parts = @()
+    $ex = $_.Exception
+    while ($null -ne $ex) {
+        if (-not [string]::IsNullOrWhiteSpace($ex.Message)) { $parts += $ex.Message }
+        $ex = $ex.InnerException
+    }
+    [System.IO.File]::WriteAllText($env:CURL2URL_OCR_ERR, ($parts -join ' -> '), [System.Text.UTF8Encoding]::new($false))
+    exit 1
+}
+";
+
+        public static bool TryRecognize(Bitmap source, out string text, out string error)
+        {
+            text = "";
+            error = "";
+            string imagePath = null;
+            string outPath = null;
+            string errPath = null;
+
+            try
+            {
+                imagePath = TempPath(".png");
+                outPath = TempPath(".txt");
+                errPath = TempPath(".err.txt");
+
+                using (Bitmap prepared = Prepare(source))
+                {
+                    prepared.Save(imagePath, ImageFormat.Png);
+                }
+
+                string stderr;
+                int exitCode = RunScript(imagePath, outPath, errPath, out stderr);
+
+                if (File.Exists(errPath))
+                {
+                    error = File.ReadAllText(errPath, Encoding.UTF8).Trim();
+                }
+
+                if (string.IsNullOrEmpty(error))
+                {
+                    if (exitCode != 0)
+                    {
+                        error = FirstUsefulLine(stderr);
+                        if (string.IsNullOrEmpty(error))
+                        {
+                            error = "OCR 引擎异常退出（退出码 " + exitCode + "）。";
+                        }
+                    }
+                    else if (!File.Exists(outPath))
+                    {
+                        error = "OCR 引擎没有返回结果。";
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(error)) return false;
+
+                text = NormalizeOcrText(File.ReadAllText(outPath, Encoding.UTF8));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+            finally
+            {
+                TryDelete(imagePath);
+                TryDelete(outPath);
+                TryDelete(errPath);
+            }
+        }
+
+        // Windows OCR 对 12px 左右的小字识别很差，按图片宽度放大 2~3 倍后效果明显更好；
+        // 大图保持原样，同时限制总像素，避免超大截图吃掉内存。
+        private static Bitmap Prepare(Bitmap source)
+        {
+            int width = source.Width;
+            int height = source.Height;
+            int maxDimension = Math.Max(width, height);
+            if (width <= 0 || height <= 0) throw new InvalidOperationException("图片尺寸无效。");
+
+            double scale;
+            if (width < 1000 && maxDimension * 3 <= MaxScaledDimension)
+            {
+                scale = 3;
+            }
+            else if (maxDimension * 2 <= MaxScaledDimension)
+            {
+                scale = 2;
+            }
+            else
+            {
+                scale = Math.Min(1.0, (double)MaxScaledDimension / maxDimension);
+            }
+
+            double pixels = (width * scale) * (height * scale);
+            if (pixels > MaxScaledPixels)
+            {
+                scale *= Math.Sqrt(MaxScaledPixels / pixels);
+            }
+
+            int scaledWidth = Math.Max(1, (int)Math.Round(width * scale));
+            int scaledHeight = Math.Max(1, (int)Math.Round(height * scale));
+
+            Bitmap result = new Bitmap(scaledWidth, scaledHeight, PixelFormat.Format24bppRgb);
+            try
+            {
+                using (Graphics graphics = Graphics.FromImage(result))
+                {
+                    graphics.CompositingQuality = CompositingQuality.HighQuality;
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    graphics.SmoothingMode = SmoothingMode.HighQuality;
+                    // 透明截图（如部分手机截图）铺白底，否则透明区域会变成黑块
+                    graphics.Clear(Color.White);
+                    graphics.DrawImage(source, new Rectangle(0, 0, scaledWidth, scaledHeight));
+                }
+                return result;
+            }
+            catch (Exception)
+            {
+                result.Dispose();
+                throw;
+            }
+        }
+
+        private static int RunScript(string imagePath, string outPath, string errPath, out string stderr)
+        {
+            string powershell = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "WindowsPowerShell", "v1.0", "powershell.exe");
+            if (!File.Exists(powershell)) powershell = "powershell.exe";
+
+            ProcessStartInfo info = new ProcessStartInfo();
+            info.FileName = powershell;
+            info.Arguments = "-NoProfile -NonInteractive -EncodedCommand " +
+                             Convert.ToBase64String(Encoding.Unicode.GetBytes(OcrScript));
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            info.RedirectStandardOutput = true;
+            info.RedirectStandardError = true;
+            info.StandardOutputEncoding = Encoding.UTF8;
+            info.StandardErrorEncoding = Encoding.UTF8;
+            info.EnvironmentVariables["CURL2URL_OCR_IMG"] = imagePath;
+            info.EnvironmentVariables["CURL2URL_OCR_OUT"] = outPath;
+            info.EnvironmentVariables["CURL2URL_OCR_ERR"] = errPath;
+
+            using (Process process = new Process())
+            {
+                process.StartInfo = info;
+                process.Start();
+
+                Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+                Task<string> errorTask = process.StandardError.ReadToEndAsync();
+
+                if (!process.WaitForExit(TimeoutMilliseconds))
+                {
+                    try
+                    {
+                        process.Kill();
+                    }
+                    catch (Exception)
+                    {
+                    }
+                    stderr = "识别超时（超过 60 秒），可以换一张更小、更清晰的截图。";
+                    return -1;
+                }
+
+                stderr = errorTask.Result;
+                string stdout = outputTask.Result;
+                if (string.IsNullOrEmpty(stderr)) stderr = stdout;
+                return process.ExitCode;
+            }
+        }
+
+        // Windows OCR 会输出「系 统 繁 忙」这种字间空格，这里只去掉相邻中文 / 全角标点之间的空格，
+        // 保留行与行、英文单词之间的空格。
+        internal static string NormalizeOcrText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+
+            text = text.Replace("\r\n", "\n").Replace('\r', '\n');
+            text = Regex.Replace(
+                text,
+                @"(?<=[\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uFF00-\uFFEF])[ \t\u00A0\u3000]+(?=[\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uFF00-\uFFEF])",
+                "");
+
+            string[] lines = text.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd();
+                // 纯英文 / 代码行里，中文 OCR 引擎偶尔会把 : ( ) 之类识别成全角；
+                // 这里转回半角并去掉标点前的空格，URL、状态码、报错原文更接近截图。
+                if (line.Length > 0 && !HanPattern.IsMatch(line)) line = NormalizeLatinLine(line);
+                lines[i] = line;
+            }
+            return string.Join(Environment.NewLine, lines).Trim();
+        }
+
+        private static string NormalizeLatinLine(string line)
+        {
+            StringBuilder builder = new StringBuilder(line.Length);
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (c >= '！' && c <= '～')
+                {
+                    // 全角 ASCII（！到 ～）转半角
+                    builder.Append((char)(c - 0xFEE0));
+                }
+                else if (c == '　')
+                {
+                    builder.Append(' ');
+                }
+                else
+                {
+                    builder.Append(c);
+                }
+            }
+
+            string result = builder.ToString();
+            return Regex.Replace(result, @" +([,.;:!?)\]])", "$1");
+        }
+
+        private static string TempPath(string suffix)
+        {
+            return Path.Combine(Path.GetTempPath(), "curl2url-ocr-" + Guid.NewGuid().ToString("N") + suffix);
+        }
+
+        private static string FirstUsefulLine(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            foreach (string line in lines)
+            {
+                string trimmed = line.Trim();
+                if (trimmed.Length > 0 && trimmed.IndexOf("CLIXML", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    return trimmed;
+                }
+            }
+            return "";
+        }
+
+        private static void TryDelete(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception)
+            {
+                // 临时文件删不掉不影响结果
+            }
         }
     }
 
