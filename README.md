@@ -4,6 +4,22 @@
 
 专治微信开发者工具 / Chrome 网络面板：右键只能复制 cURL，粘出来一堆 header、cookie、body；或者 HAR 文件太大没法看。两种都直接粘进来即可。
 
+## 下载安装
+
+- **Windows（推荐）**：直接下载 [curl2url.exe](https://github.com/nihaocss/curl2url/releases/latest/download/curl2url.exe)，免安装，双击运行。需要 .NET Framework 4.8（Windows 10 / 11 自带）。
+- **macOS / Linux**：没有 GUI 安装包，可安装 Node.js 后使用仓库里的 `curl2url.js` 命令行。
+- **iOS / Android**：不支持。本项目是 Windows 桌面工具，没有移动端版本。
+
+> 程序未做数字签名，Windows 首次运行时可能出现 SmartScreen 提示，选择「更多信息 → 仍要运行」即可。
+
+## 平台支持
+
+| 平台 | 支持情况 |
+|---|---|
+| Windows | ✅ 提供 exe，免安装 |
+| macOS / Linux | ⚠️ 仅 Node 命令行 |
+| iOS / Android | ❌ 无移动端版本 |
+
 ## 快速开始（桌面版）
 
 **双击桌面的 `curl2url` 快捷方式**（或直接运行 `curl2url.exe`）。
