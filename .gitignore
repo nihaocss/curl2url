@@ -1,6 +1,7 @@
 # 编译中间产物
 *.new.exe
 MakeIcon.exe
+MakeIconFromImage.exe
 *.pdb
 
 # 编辑器 / VS
