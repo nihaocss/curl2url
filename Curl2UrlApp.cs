@@ -183,6 +183,17 @@ namespace Curl2Url
             Font = new Font("Microsoft YaHei UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
 
+            // WinForms 窗体默认用框架自带图标，不会自动继承 exe 内嵌图标，
+            // 这里显式取 exe 图标，标题栏 / 任务栏 / Alt+Tab 才会显示新图标
+            try
+            {
+                Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch (Exception)
+            {
+                // 取不到就保留系统默认图标，不影响功能
+            }
+
             TableLayoutPanel root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
             root.ColumnCount = 1;
