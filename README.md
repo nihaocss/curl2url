@@ -45,6 +45,7 @@
 - 默认按 URL 去重；支持 `http://`、`https://`、`ws://`、`wss://`
 - 默认隐藏超长参数值和 token / sign / session / cookie / authorization 一类字段
 - 请求详情 / 失败请求里自动隐藏 `User-Agent`、`Accept-Language`、`Sec-Fetch-*`、`Vary`、`X-Powered-By`、缓存控制等浏览器 / 网关通用头，末尾提示隐藏了几个；只保留 `Origin`、`Referer`、`Content-Type`、`Cookie`、自定义头和 `X-Request-Id` / `X-Trace-Id` 这类追踪头
+- 勾选「保留响应」时，响应头里的 CORS（`Access-Control-*`）、跨域策略、缓存 / 安全策略等通用头也会隐藏，完全重复的头会合并；保留 `Content-Type`、`Set-Cookie`、`Location`、`X-Request-Id` / `X-Trace-Id` 等有用字段
 - `openid` / `openId` 不参与打码，始终完整显示
 - 下方结果框（URL / 请求详情 / 失败请求 / 日志人话）可直接 `Ctrl+A` 全选、`Ctrl+C` 复制（没选区时复制整页）；也可以右键选「全选 / 复制 / 全选并复制」
 

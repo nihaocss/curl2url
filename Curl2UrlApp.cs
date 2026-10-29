@@ -22,9 +22,9 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyProduct("curl2url")]
 [assembly: System.Reflection.AssemblyCompany("lizhuoyu")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 lizhuoyu")]
-[assembly: System.Reflection.AssemblyVersion("1.0.9.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.9.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.9")]
+[assembly: System.Reflection.AssemblyVersion("1.0.10.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.10.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.10")]
 
 namespace Curl2Url
 {
@@ -2110,6 +2110,16 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             responseRequest.StatusText = "Server Error";
             responseRequest.ResponseHeaders.Add(
                 new KeyValuePair<string, string>("Content-Type", "application/json"));
+            responseRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("Access-Control-Allow-Origin", "*"));
+            responseRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("Access-Control-Allow-Origin", "*"));
+            responseRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE"));
+            responseRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("X-Trace-Id", "trace-123"));
+            responseRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("X-Trace-Id", "trace-123"));
             responseRequest.ResponseBody = "{\"code\":500}";
             List<CurlRequest> responseRequests = new List<CurlRequest>();
             responseRequests.Add(responseRequest);
@@ -2124,6 +2134,11 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             if (!fullDetails.Contains("响应体:") || !fullDetails.Contains("\"code\": 500"))
                 return "勾选保留响应后没有输出响应体";
             if (!fullDetails.Contains("响应头:")) return "勾选保留响应后没有输出响应头";
+            if (fullDetails.Contains("Access-Control-")) return "响应头没有过滤掉 CORS 通用头";
+            if (!fullDetails.Contains("X-Trace-Id: trace-123")) return "响应头误删了追踪头";
+            int traceIndex = fullDetails.IndexOf("X-Trace-Id", StringComparison.Ordinal);
+            if (fullDetails.IndexOf("X-Trace-Id", traceIndex + 1, StringComparison.Ordinal) >= 0)
+                return "重复响应头没有合并";
 
             _tabs.SelectedIndex = 0;
             UpdateWorkspaceForTab();
@@ -7213,28 +7228,48 @@ catch {
             bool response)
         {
             int hidden = 0;
+            int duplicates = 0;
             bool wrote = false;
+            HashSet<string> seenValues = new HashSet<string>(StringComparer.Ordinal);
+            HashSet<string> hiddenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (KeyValuePair<string, string> pair in headers)
             {
+                string name = (pair.Key ?? "").Trim();
                 bool noise = response
-                    ? Sensitive.IsNoiseResponseHeader(pair.Key)
-                    : Sensitive.IsNoiseRequestHeader(pair.Key);
+                    ? Sensitive.IsNoiseResponseHeader(name)
+                    : Sensitive.IsNoiseRequestHeader(name);
                 if (noise)
                 {
-                    hidden++;
+                    if (hiddenNames.Add(name)) hidden++;
                     continue;
                 }
 
-                string value = mask ? Sensitive.MaskHeader(pair.Key, pair.Value) : pair.Value;
-                sb.AppendLine("    " + pair.Key + ": " + value);
+                string value = pair.Value ?? "";
+                if (!seenValues.Add(name.ToLowerInvariant() + "\n" + value))
+                {
+                    duplicates++;
+                    continue;
+                }
+
+                sb.AppendLine("    " + name + ": " + (mask ? Sensitive.MaskHeader(name, value) : value));
                 wrote = true;
             }
 
             if (!wrote) sb.AppendLine("    （无）");
-            if (hidden > 0)
+            if (hidden > 0 || duplicates > 0)
             {
-                sb.AppendLine("    （已隐藏 " + hidden + " 个" + (response ? "通用响应头" : "浏览器通用头") + "）");
+                string note = "";
+                if (hidden > 0)
+                {
+                    note = "已隐藏 " + hidden + " 个" + (response ? "通用响应头" : "浏览器通用头");
+                }
+                if (duplicates > 0)
+                {
+                    if (note.Length > 0) note += "；";
+                    note += "合并 " + duplicates + " 个重复项";
+                }
+                sb.AppendLine("    （" + note + "）");
             }
         }
 
@@ -8063,7 +8098,9 @@ catch {
             "x-xss-protection", "x-download-options", "x-permitted-cross-domain-policies",
             "strict-transport-security", "referrer-policy", "x-ua-compatible",
             "etag", "last-modified", "accept-ranges", "age", "via", "alt-svc",
-            "content-security-policy", ":status"
+            "content-security-policy", "content-security-policy-report-only",
+            "permissions-policy", "timing-allow-origin", "report-to", "nel",
+            "clear-site-data", "x-dns-prefetch-control", ":status"
         };
 
         public static bool IsNoiseRequestHeader(string name)
@@ -8073,7 +8110,11 @@ catch {
 
         public static bool IsNoiseResponseHeader(string name)
         {
-            return !string.IsNullOrEmpty(name) && NoiseResponseHeaders.Contains(name.Trim());
+            if (string.IsNullOrEmpty(name)) return false;
+            string trimmed = name.Trim();
+            return NoiseResponseHeaders.Contains(trimmed)
+                || trimmed.StartsWith("access-control-", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("cross-origin-", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsOpenIdKey(string key)
