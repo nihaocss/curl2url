@@ -22,9 +22,9 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyProduct("curl2url")]
 [assembly: System.Reflection.AssemblyCompany("lizhuoyu")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 lizhuoyu")]
-[assembly: System.Reflection.AssemblyVersion("1.0.10.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.10.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.10")]
+[assembly: System.Reflection.AssemblyVersion("1.0.13.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.13.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.13")]
 
 namespace Curl2Url
 {
@@ -75,6 +75,8 @@ namespace Curl2Url
                     using (MainForm form = new MainForm())
                     {
                         form.CreateControl();
+                        // 强制创建窗体句柄，异步解析的 BeginInvoke 才能在 selftest 里回到 UI 线程
+                        IntPtr selftestHandle = form.Handle;
                         string logUiError = form.RunLogUiSelftest();
                         if (logUiError.Length > 0)
                         {
@@ -482,7 +484,84 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
         private string _lastSignature = "";
         private Form _helpDialog;
 
-        // 日志人话页签需要临时收起上方 curl 输入区，给日志让出高度
+        // 请求筛选：只影响展示，不重新解析原始内容
+        private FlowLayoutPanel _filterBar;
+        private TextBox _filterKeyword;
+        private ComboBox _filterHost;
+        private ComboBox _filterMethod;
+        private ComboBox _filterStatus;
+        private Label _filterSummary;
+        private System.Windows.Forms.Timer _filterTimer;
+        private ToolTip _filterTip;
+        private bool _updatingFilters;
+        private List<CurlRequest> _lastRequests = new List<CurlRequest>();
+        private List<string> _lastAllUrls = new List<string>();
+        private bool _lastMask = true;
+        private bool _lastKeepDuplicates;
+        private string _lastHarWarning = "";
+        private bool _lastHasParsed;
+        private string _lastAnalyzedText = "";
+
+        // 解析放到后台线程：代次号用来丢弃过期结果，避免旧内容覆盖新内容
+        private Button _cancelAnalyzeButton;
+        private bool _analysisBusy;
+        private bool _analysisWorkerRunning;
+        private bool _analysisPending;
+        private int _analysisGeneration;
+        private int _analysisBusyGeneration;
+
+        // 失败请求 AI 诊断
+        private ComboBox _failureAiPick;
+        private Button _failureAiButton;
+        private List<CurlRequest> _failureAiRequests = new List<CurlRequest>();
+        private bool _failureAiBusy;
+        private int _failureAiGeneration;
+
+        // 性能页签
+        private TabPage _performancePage;
+        private TextBox _performanceBox;
+
+        // 窗口状态 / 检查更新
+        private bool _suppressUiStateSave;
+        private Label _versionLabel;
+        private Button _updateButton;
+        private bool _updateBusy;
+
+        private sealed class ParseOutcome
+        {
+            public int Generation;
+            public string Text;
+            public string Signature;
+            public bool Mask;
+            public bool KeepDuplicates;
+            public bool IsHar;
+            public bool IsList;
+            public List<CurlRequest> Requests;
+            public List<string> AllUrls;
+            public string HarWarning;
+            public Exception Error;
+        }
+
+        private sealed class UiState
+        {
+            public int X { get; set; }
+            public int Y { get; set; }
+            public int Width { get; set; }
+            public int Height { get; set; }
+            public bool Maximized { get; set; }
+            public int TabIndex { get; set; }
+        }
+
+        private sealed class DomainPerformance
+        {
+            public int Count;
+            public int Failures;
+            public int Timed;
+            public double TotalMs;
+            public double MaxMs;
+        }
+
+        // 日志翻译页签需要临时收起上方 curl 输入区，给日志让出高度
         private TableLayoutPanel _rootLayout;
         private Label _curlSectionLabel;
         private FlowLayoutPanel _curlToolbar;
@@ -498,7 +577,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
         private bool _ocrModeChanging;
         private bool _ocrBusy;
 
-        // 日志人话页签
+        // 日志翻译页签
         private TabPage _logPage;
         private TextBox _logInput;
         private TextBox _logOutput;
@@ -513,7 +592,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
         public MainForm()
         {
-            Text = "curl2url · cURL / HAR 解析 / 日志人话";
+            Text = "curl2url · cURL / HAR 解析 / 日志翻译";
             ClientSize = new Size(900, 700);
             MinimumSize = new Size(760, 580);
             StartPosition = FormStartPosition.CenterScreen;
@@ -523,6 +602,10 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
             // 教程窗口内容较长，启动后空闲时先建好，第一次点按钮不再卡一下
             Shown += delegate { BeginInvoke(new Action(PreloadHelpDialog)); };
+
+            // 窗口位置 / 大小 / 上次所在页签在关闭时保存，下次启动恢复
+            Load += delegate { LoadUiState(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e) { SaveUiState(); };
 
             // WinForms 窗体默认用框架自带图标，不会自动继承 exe 内嵌图标，
             // 这里显式取 exe 图标，标题栏 / 任务栏 / Alt+Tab 才会显示新图标
@@ -539,13 +622,14 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _rootLayout = root;
             root.Dock = DockStyle.Fill;
             root.ColumnCount = 1;
-            root.RowCount = 7;
+            root.RowCount = 8;
             root.Padding = new Padding(18);
             root.BackColor = PageBack;
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 42F));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 58F));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -585,11 +669,31 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             titleBlock.Controls.Add(subtitle);
             header.Controls.Add(titleBlock, 0, 0);
 
+            FlowLayoutPanel headerActions = new FlowLayoutPanel();
+            headerActions.FlowDirection = FlowDirection.LeftToRight;
+            headerActions.WrapContents = false;
+            headerActions.AutoSize = true;
+            headerActions.Dock = DockStyle.Fill;
+            headerActions.Margin = new Padding(0);
+
+            _versionLabel = new Label();
+            _versionLabel.Text = "v" + CurrentVersionText();
+            _versionLabel.AutoSize = true;
+            _versionLabel.ForeColor = FaintColor;
+            _versionLabel.Margin = new Padding(0, 9, 8, 0);
+
+            _updateButton = MakeSmallButton("检查更新", 88);
+            _updateButton.Margin = new Padding(0, 0, 8, 0);
+            _updateButton.Click += delegate { CheckForUpdates(); };
+
             Button helpButton = MakeSmallButton("使用教程", 88);
-            helpButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            helpButton.Margin = new Padding(12, 0, 0, 0);
+            helpButton.Margin = new Padding(0);
             helpButton.Click += delegate { ShowCopyFormatHelp(); };
-            header.Controls.Add(helpButton, 1, 0);
+
+            headerActions.Controls.Add(_versionLabel);
+            headerActions.Controls.Add(_updateButton);
+            headerActions.Controls.Add(helpButton);
+            header.Controls.Add(headerActions, 1, 0);
 
             root.Controls.Add(header, 0, 0);
 
@@ -637,11 +741,12 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             Button openButton = MakeButton("打开 HAR 文件", false, 112);
             openButton.Click += delegate { OpenHarFile(); };
 
-            Button ocrButton = MakeButton("截图识别", false, 88);
-            ocrButton.Click += delegate { ShowOcrPage(true); };
-
             Button clearButton = MakeButton("清空", false, 64);
             clearButton.Click += delegate { ClearAll(); };
+
+            _cancelAnalyzeButton = MakeButton("取消解析", false, 88);
+            _cancelAnalyzeButton.Visible = false;
+            _cancelAnalyzeButton.Click += delegate { CancelAnalysis(); };
 
             _keepDuplicates = new CheckBox();
             _keepDuplicates.Text = "保留重复 URL";
@@ -676,8 +781,8 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
             buttons.Controls.Add(pasteButton);
             buttons.Controls.Add(openButton);
-            buttons.Controls.Add(ocrButton);
             buttons.Controls.Add(clearButton);
+            buttons.Controls.Add(_cancelAnalyzeButton);
             buttons.Controls.Add(_keepDuplicates);
             buttons.Controls.Add(_maskSensitive);
             buttons.Controls.Add(_keepResponses);
@@ -685,7 +790,10 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _curlToolbar = buttons;
             root.Controls.Add(buttons, 0, 3);
 
-            // 结果区：三个页签
+            _filterBar = BuildFilterBar();
+            root.Controls.Add(_filterBar, 0, 4);
+
+            // 结果区：七个页签
             TabControl tabs = new TabControl();
             tabs.Dock = DockStyle.Fill;
             tabs.Font = new Font("Microsoft YaHei UI", 9F);
@@ -742,8 +850,73 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _failureBox.ForeColor = TitleColor;
             _failureBox.BorderStyle = BorderStyle.FixedSingle;
             _failureBox.Dock = DockStyle.Fill;
+            _failureBox.Margin = new Padding(0);
             AttachOutputMenu(_failureBox, false);
-            _failurePage.Controls.Add(_failureBox);
+
+            TableLayoutPanel failureLayout = new TableLayoutPanel();
+            failureLayout.Dock = DockStyle.Fill;
+            failureLayout.ColumnCount = 1;
+            failureLayout.RowCount = 2;
+            failureLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            failureLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            failureLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            FlowLayoutPanel failureBar = new FlowLayoutPanel();
+            failureBar.FlowDirection = FlowDirection.LeftToRight;
+            failureBar.WrapContents = true;
+            failureBar.AutoSize = true;
+            failureBar.Dock = DockStyle.Fill;
+            failureBar.Margin = new Padding(0, 0, 0, 6);
+
+            Label failurePickLabel = new Label();
+            failurePickLabel.Text = "诊断请求";
+            failurePickLabel.AutoSize = true;
+            failurePickLabel.ForeColor = LabelColor;
+            failurePickLabel.Margin = new Padding(0, 9, 6, 0);
+
+            _failureAiPick = new ComboBox();
+            _failureAiPick.DropDownStyle = ComboBoxStyle.DropDownList;
+            _failureAiPick.Width = 430;
+            _failureAiPick.Font = new Font("Microsoft YaHei UI", 8.5F);
+            _failureAiPick.Margin = new Padding(0, 3, 8, 0);
+            _failureAiPick.Enabled = false;
+            _failureAiPick.Items.Add("（解析出失败请求后可选择）");
+
+            _failureAiButton = MakeSmallButton("AI 诊断（联网）", 126);
+            _failureAiButton.Enabled = false;
+            _failureAiButton.Click += delegate { DiagnoseFailureWithAi(); };
+
+            Label failureAiHint = new Label();
+            failureAiHint.Text = "只发送选中请求，Token / Cookie 已打码";
+            failureAiHint.AutoSize = true;
+            failureAiHint.ForeColor = FaintColor;
+            failureAiHint.Margin = new Padding(8, 9, 0, 0);
+
+            failureBar.Controls.Add(failurePickLabel);
+            failureBar.Controls.Add(_failureAiPick);
+            failureBar.Controls.Add(_failureAiButton);
+            failureBar.Controls.Add(failureAiHint);
+            failureLayout.Controls.Add(failureBar, 0, 0);
+            failureLayout.Controls.Add(_failureBox, 0, 1);
+            _failurePage.Controls.Add(failureLayout);
+
+            _performancePage = new TabPage("性能");
+            _performancePage.BackColor = Color.White;
+            _performancePage.UseVisualStyleBackColor = false;
+            _performancePage.Padding = new Padding(8);
+
+            _performanceBox = new TextBox();
+            _performanceBox.Multiline = true;
+            _performanceBox.ReadOnly = true;
+            _performanceBox.WordWrap = true;
+            _performanceBox.ScrollBars = ScrollBars.Vertical;
+            _performanceBox.Font = new Font("Consolas", 9.5F);
+            _performanceBox.BackColor = Color.White;
+            _performanceBox.ForeColor = TitleColor;
+            _performanceBox.BorderStyle = BorderStyle.FixedSingle;
+            _performanceBox.Dock = DockStyle.Fill;
+            AttachOutputMenu(_performanceBox, false);
+            _performancePage.Controls.Add(_performanceBox);
 
             TabPage responsePage = new TabPage("响应");
             responsePage.BackColor = Color.White;
@@ -816,11 +989,12 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             tabs.TabPages.Add(urlPage);
             tabs.TabPages.Add(detailPage);
             tabs.TabPages.Add(_failurePage);
+            tabs.TabPages.Add(_performancePage);
             tabs.TabPages.Add(responsePage);
             tabs.TabPages.Add(_ocrPage);
             tabs.TabPages.Add(_logPage);
             tabs.SelectedIndexChanged += delegate { UpdateWorkspaceForTab(); };
-            root.Controls.Add(tabs, 0, 4);
+            root.Controls.Add(tabs, 0, 5);
 
             _statusLabel = new Label();
             _statusLabel.Text = "就绪";
@@ -831,14 +1005,409 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
             _statusLabel.AutoEllipsis = true;
             _statusLabel.Margin = new Padding(0, 8, 0, 0);
-            root.Controls.Add(_statusLabel, 0, 5);
+            root.Controls.Add(_statusLabel, 0, 6);
 
             Label footnote = new Label();
             footnote.Text = "支持多条 curl、HAR（.har / JSON）、http/https/ws/wss；日志支持 Spring / Java / K8s / MyBatis 常见格式；长 Token 默认打码。";
             footnote.ForeColor = FaintColor;
             footnote.AutoSize = true;
             footnote.Margin = new Padding(0, 4, 0, 0);
-            root.Controls.Add(footnote, 0, 6);
+            root.Controls.Add(footnote, 0, 7);
+        }
+
+        private static string CurrentVersionText()
+        {
+            Version version = typeof(MainForm).Assembly.GetName().Version;
+            if (version == null) return "0.0.0";
+            return version.Major + "." + version.Minor + "." + Math.Max(0, version.Build);
+        }
+
+        private static string UiStatePath()
+        {
+            string folder = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return Path.Combine(Path.Combine(folder, "curl2url"), "ui-state.json");
+        }
+
+        private void LoadUiState()
+        {
+            if (_suppressUiStateSave) return;
+            try
+            {
+                string path = UiStatePath();
+                if (!File.Exists(path)) return;
+                UiState state = new JavaScriptSerializer().Deserialize<UiState>(
+                    File.ReadAllText(path, Encoding.UTF8));
+                if (state == null) return;
+
+                Rectangle target = new Rectangle(state.X, state.Y, state.Width, state.Height);
+                if (state.Width >= MinimumSize.Width &&
+                    state.Height >= MinimumSize.Height &&
+                    IsMostlyOnScreen(target))
+                {
+                    StartPosition = FormStartPosition.Manual;
+                    Bounds = target;
+                }
+
+                if (_tabs != null && state.TabIndex >= 0 && state.TabIndex < _tabs.TabPages.Count)
+                {
+                    _tabs.SelectedIndex = state.TabIndex;
+                    UpdateWorkspaceForTab();
+                }
+                if (state.Maximized) WindowState = FormWindowState.Maximized;
+            }
+            catch (Exception)
+            {
+                // 状态文件损坏或版本变化时忽略，继续用默认窗口位置
+            }
+        }
+
+        private static bool IsMostlyOnScreen(Rectangle target)
+        {
+            foreach (Screen screen in Screen.AllScreens)
+            {
+                Rectangle visible = Rectangle.Intersect(target, screen.WorkingArea);
+                if (visible.Width >= 160 && visible.Height >= 80) return true;
+            }
+            return false;
+        }
+
+        private void SaveUiState()
+        {
+            if (_suppressUiStateSave) return;
+            try
+            {
+                Rectangle bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+                if (bounds.Width <= 0 || bounds.Height <= 0)
+                {
+                    bounds = new Rectangle(Left, Top, Width, Height);
+                }
+                UiState state = new UiState();
+                state.X = bounds.X;
+                state.Y = bounds.Y;
+                state.Width = bounds.Width;
+                state.Height = bounds.Height;
+                state.Maximized = WindowState == FormWindowState.Maximized;
+                state.TabIndex = _tabs == null ? 0 : _tabs.SelectedIndex;
+
+                string path = UiStatePath();
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(
+                    path,
+                    new JavaScriptSerializer().Serialize(state),
+                    new UTF8Encoding(false));
+            }
+            catch (Exception)
+            {
+                // 保存失败不影响正常退出
+            }
+        }
+
+        private static Version ParseReleaseVersion(string text)
+        {
+            string value = (text ?? "").Trim();
+            if (value.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+            {
+                value = value.Substring(1);
+            }
+            int cut = value.IndexOfAny(new char[] { '-', '+', ' ' });
+            if (cut > 0) value = value.Substring(0, cut);
+            Version parsed;
+            return Version.TryParse(value, out parsed) ? NormalizeVersion(parsed) : null;
+        }
+
+        private static Version NormalizeVersion(Version version)
+        {
+            if (version == null) return null;
+            return new Version(
+                version.Major,
+                version.Minor,
+                Math.Max(0, version.Build),
+                Math.Max(0, version.Revision));
+        }
+
+        private static string ReleaseString(Dictionary<string, object> data, string key)
+        {
+            object value;
+            if (data == null || !data.TryGetValue(key, out value) || value == null) return "";
+            return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+        }
+
+        private static bool TryGitHubGet(
+            string url, bool useSystemProxy, out string body, out string finalUrl, out string error)
+        {
+            body = "";
+            finalUrl = url;
+            error = "";
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+                if (!useSystemProxy) request.Proxy = null;
+                request.UserAgent = "curl2url/" + CurrentVersionText();
+                request.Accept = "application/vnd.github+json, text/html";
+                request.Timeout = 8000;
+                request.ReadWriteTimeout = 8000;
+                request.AutomaticDecompression =
+                    DecompressionMethods.GZip | DecompressionMethods.Deflate;
+
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (Stream stream = response.GetResponseStream())
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    body = reader.ReadToEnd();
+                    if (response.ResponseUri != null) finalUrl = response.ResponseUri.ToString();
+                }
+                return true;
+            }
+            catch (WebException ex)
+            {
+                HttpWebResponse response = ex.Response as HttpWebResponse;
+                string detail = "";
+                int status = 0;
+                if (response != null)
+                {
+                    status = (int)response.StatusCode;
+                    try
+                    {
+                        using (Stream stream = response.GetResponseStream())
+                        using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                        {
+                            detail = reader.ReadToEnd();
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+
+                if (status == 403 &&
+                    detail.IndexOf("rate limit", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    error = "GitHub API 当前出口 IP 请求次数超限（HTTP 403）";
+                }
+                else if (ex.Status == WebExceptionStatus.Timeout)
+                {
+                    error = "连接超时（8 秒）";
+                }
+                else if (status > 0)
+                {
+                    error = "HTTP " + status;
+                    string apiMessage = ExtractGitHubMessage(detail);
+                    if (apiMessage.Length > 0) error += "：" + ClipText(apiMessage, 160);
+                }
+                else
+                {
+                    error = ex.Message;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static string ExtractGitHubMessage(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return "";
+            try
+            {
+                Dictionary<string, object> data =
+                    new JavaScriptSerializer().DeserializeObject(json)
+                        as Dictionary<string, object>;
+                return ReleaseString(data, "message").Trim();
+            }
+            catch (Exception)
+            {
+                return "";
+            }
+        }
+
+        private static string ExtractReleaseTag(string finalUrl, string html)
+        {
+            const string marker = "/releases/tag/";
+            int index = finalUrl.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (index >= 0)
+            {
+                string value = finalUrl.Substring(index + marker.Length);
+                int cut = value.IndexOfAny(new char[] { '?', '#', '/' });
+                if (cut >= 0) value = value.Substring(0, cut);
+                return Uri.UnescapeDataString(value);
+            }
+
+            Match match = Regex.Match(html ?? "", "/releases/tag/([A-Za-z0-9._-]+)");
+            return match.Success ? match.Groups[1].Value : "";
+        }
+
+        private static bool ReadLatestReleaseJson(
+            string json, out string tag, out string pageUrl, out string notes)
+        {
+            tag = "";
+            pageUrl = "";
+            notes = "";
+            try
+            {
+                Dictionary<string, object> data =
+                    new JavaScriptSerializer().DeserializeObject(json)
+                        as Dictionary<string, object>;
+                tag = ReleaseString(data, "tag_name").Trim();
+                pageUrl = ReleaseString(data, "html_url").Trim();
+                notes = ReleaseString(data, "body");
+                return tag.Length > 0;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static string FetchLatestRelease(
+            out string tag, out string pageUrl, out string notes)
+        {
+            tag = "";
+            pageUrl = "";
+            notes = "";
+            List<string> errors = new List<string>();
+            string body;
+            string finalUrl;
+            string error;
+            const string apiUrl =
+                "https://api.github.com/repos/nihaocss/curl2url/releases/latest";
+            const string releasesUrl =
+                "https://github.com/nihaocss/curl2url/releases/latest";
+
+            // 先走系统代理；部分共享代理的出口 IP 会被 GitHub API 限流，再直连试一次。
+            if (TryGitHubGet(apiUrl, true, out body, out finalUrl, out error))
+            {
+                if (ReadLatestReleaseJson(body, out tag, out pageUrl, out notes)) return "";
+                errors.Add("API 返回里没有版本号");
+            }
+            else
+            {
+                errors.Add("系统代理：" + error);
+            }
+
+            if (TryGitHubGet(apiUrl, false, out body, out finalUrl, out error))
+            {
+                if (ReadLatestReleaseJson(body, out tag, out pageUrl, out notes)) return "";
+                errors.Add("直连 API 返回里没有版本号");
+            }
+            else
+            {
+                errors.Add("直连：" + error);
+            }
+
+            // API 完全不可用时，用 GitHub 的 releases/latest 跳转地址兜底。
+            if (TryGitHubGet(releasesUrl, true, out body, out finalUrl, out error))
+            {
+                tag = ExtractReleaseTag(finalUrl, body);
+                pageUrl = finalUrl;
+                if (tag.Length > 0) return "";
+                errors.Add("发布页里没有找到版本号");
+            }
+            else
+            {
+                errors.Add("发布页：" + error);
+            }
+
+            return "已尝试系统代理、直连和发布页，仍未取到最新版本。\r\n" +
+                string.Join("\r\n", errors.ToArray());
+        }
+
+        private void CheckForUpdates()
+        {
+            if (_updateBusy) return;
+            _updateBusy = true;
+            if (_updateButton != null)
+            {
+                _updateButton.Enabled = false;
+                _updateButton.Text = "检查中…";
+            }
+            SetStatus("正在检查 GitHub 最新版本…", MutedColor);
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string tag = "";
+                string pageUrl = "";
+                string notes = "";
+                string error = FetchLatestRelease(out tag, out pageUrl, out notes);
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed || Disposing) return;
+                        _updateBusy = false;
+                        if (_updateButton != null)
+                        {
+                            _updateButton.Text = "检查更新";
+                            _updateButton.Enabled = true;
+                        }
+
+                        if (error.Length > 0)
+                        {
+                            SetStatus("检查更新失败：" + error, ErrorColor);
+                            MessageBox.Show(this,
+                                "检查更新失败：\r\n" + error +
+                                "\r\n\r\n可以稍后再试，或直接打开 GitHub Releases 页面。",
+                                "curl2url", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+
+                        Version current = ParseReleaseVersion(CurrentVersionText());
+                        Version latest = ParseReleaseVersion(tag);
+                        if (latest == null)
+                        {
+                            SetStatus("线上版本号无法识别：" + tag, ErrorColor);
+                            return;
+                        }
+
+                        if (current != null && latest > current)
+                        {
+                            SetStatus("发现新版本 " + tag + "（当前 v" + CurrentVersionText() + "）。", OkColor);
+                            string summary = string.IsNullOrWhiteSpace(notes)
+                                ? ""
+                                : "\r\n\r\n更新说明（节选）：\r\n" + ClipText(notes.Trim(), 1200);
+                            DialogResult open = MessageBox.Show(this,
+                                "发现新版本 " + tag + "，当前是 v" + CurrentVersionText() + "。" +
+                                summary + "\r\n\r\n是否打开下载页？",
+                                "发现新版本",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Information,
+                                MessageBoxDefaultButton.Button1);
+                            if (open == DialogResult.Yes)
+                            {
+                                string target = pageUrl.Length > 0
+                                    ? pageUrl
+                                    : "https://github.com/nihaocss/curl2url/releases/latest";
+                                try
+                                {
+                                    Process.Start(target);
+                                }
+                                catch (Exception ex)
+                                {
+                                    MessageBox.Show(this, "打开下载页失败：" + ex.Message,
+                                        "curl2url", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            SetStatus("已是最新版本 v" + CurrentVersionText() + "。", OkColor);
+                            MessageBox.Show(this,
+                                "当前已是最新版本 v" + CurrentVersionText() + "（线上 " + tag + "）。",
+                                "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    });
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
         }
 
         private static Label MakeSectionLabel(string text)
@@ -888,6 +1457,947 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             button.Height = 30;
             button.Font = new Font("Microsoft YaHei UI", 8.5F);
             return button;
+        }
+
+        private FlowLayoutPanel BuildFilterBar()
+        {
+            FlowLayoutPanel bar = new FlowLayoutPanel();
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            bar.WrapContents = true;
+            bar.AutoSize = true;
+            bar.Dock = DockStyle.Fill;
+            bar.BackColor = PageBack;
+            bar.Margin = new Padding(0, 0, 0, 8);
+
+            Label caption = new Label();
+            caption.Text = "筛选";
+            caption.ForeColor = LabelColor;
+            caption.AutoSize = true;
+            caption.Margin = new Padding(0, 8, 6, 0);
+
+            Label keywordLabel = new Label();
+            keywordLabel.Text = "URL 含";
+            keywordLabel.ForeColor = MutedColor;
+            keywordLabel.AutoSize = true;
+            keywordLabel.Margin = new Padding(0, 8, 4, 0);
+
+            _filterKeyword = new TextBox();
+            _filterKeyword.Width = 158;
+            _filterKeyword.Font = new Font("Microsoft YaHei UI", 9F);
+            _filterKeyword.Margin = new Padding(0, 3, 8, 0);
+            _filterKeyword.TextChanged += delegate { ScheduleFilter(); };
+
+            _filterHost = new ComboBox();
+            _filterHost.DropDownStyle = ComboBoxStyle.DropDown;
+            _filterHost.Width = 150;
+            _filterHost.Font = new Font("Microsoft YaHei UI", 9F);
+            _filterHost.Margin = new Padding(0, 2, 8, 0);
+            _filterHost.Items.Add("全部域名");
+            _filterHost.Text = "全部域名";
+            _filterHost.TextChanged += delegate { ScheduleFilter(); };
+
+            _filterMethod = new ComboBox();
+            _filterMethod.DropDownStyle = ComboBoxStyle.DropDownList;
+            _filterMethod.Width = 92;
+            _filterMethod.Font = new Font("Microsoft YaHei UI", 9F);
+            _filterMethod.Margin = new Padding(0, 2, 8, 0);
+            _filterMethod.Items.Add("全部方法");
+            _filterMethod.SelectedIndex = 0;
+            _filterMethod.SelectedIndexChanged += delegate { ScheduleFilter(); };
+
+            _filterStatus = new ComboBox();
+            _filterStatus.DropDownStyle = ComboBoxStyle.DropDown;
+            _filterStatus.Width = 128;
+            _filterStatus.Font = new Font("Microsoft YaHei UI", 9F);
+            _filterStatus.Margin = new Padding(0, 2, 8, 0);
+            _filterStatus.Items.Add("全部状态");
+            _filterStatus.Items.Add("2xx 成功");
+            _filterStatus.Items.Add("3xx 跳转");
+            _filterStatus.Items.Add("4xx 客户端错误");
+            _filterStatus.Items.Add("5xx 服务端错误");
+            _filterStatus.Items.Add("失败 (≥400 / 无响应)");
+            _filterStatus.Text = "全部状态";
+            _filterStatus.TextChanged += delegate { ScheduleFilter(); };
+
+            Button clear = MakeSmallButton("清除", 56);
+            clear.Margin = new Padding(0, 0, 8, 0);
+            clear.Click += delegate { ClearFilters(); };
+
+            _filterSummary = new Label();
+            _filterSummary.AutoSize = true;
+            _filterSummary.ForeColor = MutedColor;
+            _filterSummary.Margin = new Padding(0, 8, 0, 0);
+
+            _filterTip = new ToolTip();
+            _filterTip.SetToolTip(_filterKeyword, "匹配 URL 中的文字，不区分大小写");
+            _filterTip.SetToolTip(_filterHost, "选择或输入域名的一部分，例如 wxgateway");
+            _filterTip.SetToolTip(_filterMethod, "只看某个 HTTP 方法");
+            _filterTip.SetToolTip(_filterStatus, "可选状态段，也可以直接输入 500 这样的状态码");
+
+            bar.Controls.Add(caption);
+            bar.Controls.Add(keywordLabel);
+            bar.Controls.Add(_filterKeyword);
+            bar.Controls.Add(_filterHost);
+            bar.Controls.Add(_filterMethod);
+            bar.Controls.Add(_filterStatus);
+            bar.Controls.Add(clear);
+            bar.Controls.Add(_filterSummary);
+
+            _filterTimer = new System.Windows.Forms.Timer();
+            _filterTimer.Interval = 250;
+            _filterTimer.Tick += delegate
+            {
+                _filterTimer.Stop();
+                ApplyFilterView();
+            };
+
+            bar.Visible = false;
+            return bar;
+        }
+
+        private void ScheduleFilter()
+        {
+            if (_updatingFilters || _filterTimer == null) return;
+            _filterTimer.Stop();
+            _filterTimer.Start();
+        }
+
+        private void ResetFilters()
+        {
+            if (_filterKeyword == null || _filterHost == null ||
+                _filterMethod == null || _filterStatus == null) return;
+            if (_filterTimer != null) _filterTimer.Stop();
+            bool previous = _updatingFilters;
+            _updatingFilters = true;
+            try
+            {
+                _filterKeyword.Text = "";
+                _filterHost.Text = "全部域名";
+                if (_filterMethod.Items.Count > 0) _filterMethod.SelectedIndex = 0;
+                _filterStatus.Text = "全部状态";
+            }
+            finally
+            {
+                _updatingFilters = previous;
+            }
+        }
+
+        private void ClearFilters()
+        {
+            ResetFilters();
+            ApplyFilterView();
+        }
+
+        private void RefreshFilterChoices()
+        {
+            if (_filterHost == null || _filterMethod == null || _filterStatus == null) return;
+            bool previous = _updatingFilters;
+            _updatingFilters = true;
+            try
+            {
+                string host = (_filterHost.Text ?? "").Trim();
+                bool hostDefault = host.Length == 0 || host == "全部域名";
+                _filterHost.Items.Clear();
+                _filterHost.Items.Add("全部域名");
+
+                HashSet<string> seenHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<string> hosts = new List<string>();
+                foreach (string url in _lastAllUrls)
+                {
+                    string itemHost = HostOf(url);
+                    if (itemHost.Length > 0 && itemHost != url && seenHosts.Add(itemHost))
+                    {
+                        hosts.Add(itemHost);
+                    }
+                }
+                hosts.Sort(StringComparer.OrdinalIgnoreCase);
+                foreach (string itemHost in hosts) _filterHost.Items.Add(itemHost);
+                _filterHost.Text = hostDefault ? "全部域名" : host;
+
+                object selectedMethod = _filterMethod.SelectedItem;
+                string method = selectedMethod == null ? "" : selectedMethod.ToString();
+                _filterMethod.Items.Clear();
+                _filterMethod.Items.Add("全部方法");
+                HashSet<string> seenMethods = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<string> methods = new List<string>();
+                foreach (CurlRequest request in _lastRequests)
+                {
+                    string itemMethod = (request.Method ?? "").Trim();
+                    if (itemMethod.Length > 0 && seenMethods.Add(itemMethod)) methods.Add(itemMethod);
+                }
+                methods.Sort(StringComparer.OrdinalIgnoreCase);
+                foreach (string itemMethod in methods) _filterMethod.Items.Add(itemMethod);
+
+                int methodIndex = 0;
+                if (method.Length > 0 && method != "全部方法")
+                {
+                    for (int i = 1; i < _filterMethod.Items.Count; i++)
+                    {
+                        if (string.Equals(_filterMethod.Items[i].ToString(), method, StringComparison.OrdinalIgnoreCase))
+                        {
+                            methodIndex = i;
+                            break;
+                        }
+                    }
+                }
+                _filterMethod.SelectedIndex = methodIndex;
+                _filterMethod.Enabled = _lastRequests.Count > 0;
+                _filterStatus.Enabled = _lastRequests.Count > 0;
+                if (_lastRequests.Count == 0)
+                {
+                    _filterMethod.SelectedIndex = 0;
+                    _filterStatus.Text = "全部状态";
+                }
+                else if (string.IsNullOrWhiteSpace(_filterStatus.Text))
+                {
+                    _filterStatus.Text = "全部状态";
+                }
+            }
+            finally
+            {
+                _updatingFilters = previous;
+            }
+        }
+
+        private void ClearParsedData()
+        {
+            _lastRequests = new List<CurlRequest>();
+            _lastAllUrls = new List<string>();
+            _lastHarWarning = "";
+            _lastHasParsed = false;
+            if (_filterSummary != null) _filterSummary.Text = "";
+            if (_performanceBox != null) _performanceBox.Text = "";
+            ResetFailureChoices();
+            UpdateFilterBarVisibility();
+        }
+
+        private void UpdateFilterBarVisibility()
+        {
+            if (_filterBar == null || _tabs == null) return;
+            int index = _tabs.SelectedIndex;
+            bool show = _lastHasParsed && index >= 0 && index <= 3;
+            if (_filterBar.Visible != show)
+            {
+                _filterBar.Visible = show;
+                if (_rootLayout != null) _rootLayout.PerformLayout();
+            }
+        }
+
+        private static bool MatchesStatus(CurlRequest request, string filter)
+        {
+            string value = (filter ?? "").Trim();
+            if (value.Length == 0 || value == "全部状态") return true;
+            if (value.StartsWith("失败", StringComparison.Ordinal)) return request.IsFailure();
+
+            if (value.Length >= 3 && (value[1] == 'x' || value[1] == 'X') &&
+                value[0] >= '1' && value[0] <= '5')
+            {
+                return request.Status / 100 == value[0] - '0';
+            }
+
+            int code;
+            if (value.Length >= 3 && int.TryParse(value.Substring(0, 3), out code))
+            {
+                return request.Status == code;
+            }
+            return false;
+        }
+
+        private bool MatchesRequestFilter(
+            CurlRequest request, string keyword, string host, int methodIndex, string status)
+        {
+            string url = request.Url ?? "";
+            if (keyword.Length > 0 && url.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            if (host.Length > 0 && HostOf(url).IndexOf(host, StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            if (methodIndex > 0)
+            {
+                string method = _filterMethod.Items.Count > methodIndex
+                    ? _filterMethod.Items[methodIndex].ToString()
+                    : "";
+                if (!string.Equals((request.Method ?? "").Trim(), method, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return status.Length == 0 || MatchesStatus(request, status);
+        }
+
+        private static bool MatchesUrlFilter(string url, string keyword, string host)
+        {
+            string value = url ?? "";
+            if (keyword.Length > 0 && value.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            if (host.Length > 0 && HostOf(value).IndexOf(host, StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            return true;
+        }
+
+        private void ApplyFilterView()
+        {
+            if (_resultBox == null || _detailBox == null || _failureBox == null || _failurePage == null)
+                return;
+            if (_filterTimer != null) _filterTimer.Stop();
+
+            if (!_lastHasParsed)
+            {
+                if (_filterSummary != null) _filterSummary.Text = "";
+                UpdateFilterBarVisibility();
+                return;
+            }
+
+            string keyword = _filterKeyword == null ? "" : _filterKeyword.Text.Trim();
+            string host = _filterHost == null ? "" : _filterHost.Text.Trim();
+            if (host == "全部域名") host = "";
+            string status = _filterStatus == null ? "" : _filterStatus.Text.Trim();
+            if (status == "全部状态") status = "";
+            int methodIndex = _filterMethod == null ? 0 : _filterMethod.SelectedIndex;
+            bool filterActive = keyword.Length > 0 || host.Length > 0 ||
+                status.Length > 0 || methodIndex > 0;
+
+            bool hasRequests = _lastRequests.Count > 0;
+            List<CurlRequest> filteredRequests = new List<CurlRequest>();
+            List<string> allUrls = new List<string>();
+
+            if (hasRequests)
+            {
+                foreach (CurlRequest request in _lastRequests)
+                {
+                    if (!filterActive ||
+                        MatchesRequestFilter(request, keyword, host, methodIndex, status))
+                    {
+                        filteredRequests.Add(request);
+                    }
+                }
+
+                if (filterActive)
+                {
+                    foreach (CurlRequest request in filteredRequests)
+                    {
+                        if (!string.IsNullOrEmpty(request.Url)) allUrls.Add(request.Url);
+                    }
+                }
+                else
+                {
+                    allUrls.AddRange(_lastAllUrls);
+                }
+            }
+            else
+            {
+                foreach (string url in _lastAllUrls)
+                {
+                    if (!filterActive || MatchesUrlFilter(url, keyword, host)) allUrls.Add(url);
+                }
+            }
+
+            List<string> uniqueUrls = UrlExtractor.Unique(allUrls);
+            List<string> displayUrls = _lastKeepDuplicates ? allUrls : uniqueUrls;
+            List<string> maskedUrls = new List<string>();
+            foreach (string url in displayUrls)
+            {
+                maskedUrls.Add(_lastMask ? Sensitive.MaskUrl(url) : url);
+            }
+            _resultBox.Text = string.Join("\r\n", maskedUrls.ToArray());
+
+            if (filterActive && filteredRequests.Count == 0 && allUrls.Count == 0)
+            {
+                _detailBox.Text = "没有匹配的请求。\r\n\r\n清空筛选条件，或换个关键字再试。";
+                _failureBox.Text = "";
+                _failurePage.Text = "失败请求";
+                RefreshFailureChoices(filteredRequests);
+                if (_performanceBox != null)
+                {
+                    _performanceBox.Text = FormatPerformance(filteredRequests, _lastMask);
+                }
+            }
+            else
+            {
+                try
+                {
+                    string detailsText = UrlExtractor.FormatDetails(
+                        filteredRequests, allUrls, _lastMask, _keepResponses.Checked);
+                    if (_lastHarWarning.Length > 0)
+                    {
+                        detailsText = "注意：" + _lastHarWarning + "\r\n\r\n" + detailsText;
+                    }
+                    _detailBox.Text = detailsText;
+                }
+                catch (Exception ex)
+                {
+                    _detailBox.Text = "解析详情失败：" + ex.Message;
+                }
+
+                int failureCount = 0;
+                foreach (CurlRequest request in filteredRequests)
+                {
+                    if (request.IsFailure()) failureCount++;
+                }
+                try
+                {
+                    _failureBox.Text = UrlExtractor.FormatFailures(filteredRequests, _lastMask);
+                }
+                catch (Exception ex)
+                {
+                    _failureBox.Text = "解析失败请求失败：" + ex.Message;
+                }
+                _failurePage.Text = failureCount > 0
+                    ? "失败请求 (" + failureCount + ")"
+                    : "失败请求";
+                RefreshFailureChoices(filteredRequests);
+                if (_performanceBox != null)
+                {
+                    _performanceBox.Text = FormatPerformance(filteredRequests, _lastMask);
+                }
+            }
+
+            if (_filterSummary != null)
+            {
+                if (hasRequests)
+                {
+                    _filterSummary.Text = filterActive
+                        ? "显示 " + filteredRequests.Count + " / " + _lastRequests.Count + " 个请求"
+                        : "共 " + _lastRequests.Count + " 个请求";
+                }
+                else
+                {
+                    int totalUrls = _lastKeepDuplicates
+                        ? _lastAllUrls.Count
+                        : UrlExtractor.Unique(_lastAllUrls).Count;
+                    _filterSummary.Text = filterActive
+                        ? "显示 " + displayUrls.Count + " / " + totalUrls + " 个 URL"
+                        : "共 " + totalUrls + " 个 URL";
+                }
+            }
+
+            UpdateFilterBarVisibility();
+        }
+
+        private void ResetFailureChoices()
+        {
+            _failureAiGeneration++;
+            _failureAiBusy = false;
+            _failureAiRequests = new List<CurlRequest>();
+            if (_failureAiPick != null)
+            {
+                _failureAiPick.Items.Clear();
+                _failureAiPick.Items.Add("（解析出失败请求后可选择）");
+                _failureAiPick.SelectedIndex = 0;
+                _failureAiPick.Enabled = false;
+            }
+            if (_failureAiButton != null)
+            {
+                _failureAiButton.Text = "AI 诊断（联网）";
+                _failureAiButton.Enabled = false;
+            }
+        }
+
+        private void RefreshFailureChoices(List<CurlRequest> requests)
+        {
+            if (_failureAiPick == null || _failureAiButton == null) return;
+
+            CurlRequest previous = SelectedFailureRequest();
+            string previousKey = previous == null ? "" : FailureKey(previous);
+            List<CurlRequest> failures = new List<CurlRequest>();
+            if (requests != null)
+            {
+                foreach (CurlRequest request in requests)
+                {
+                    if (request.IsFailure()) failures.Add(request);
+                }
+            }
+            _failureAiRequests = failures;
+
+            _failureAiPick.Items.Clear();
+            if (failures.Count == 0)
+            {
+                _failureAiPick.Items.Add("（没有失败请求）");
+                _failureAiPick.SelectedIndex = 0;
+                _failureAiPick.Enabled = false;
+                if (!_failureAiBusy) _failureAiButton.Enabled = false;
+                return;
+            }
+
+            int selected = 0;
+            for (int i = 0; i < failures.Count; i++)
+            {
+                CurlRequest request = failures[i];
+                string url = _lastMask ? Sensitive.MaskUrl(request.Url ?? "") : (request.Url ?? "");
+                string status = request.Status > 0
+                    ? request.Status.ToString(CultureInfo.InvariantCulture)
+                    : "无响应";
+                string label = (request.Method ?? "GET") + " " + status + " · " +
+                    ClipText(url, 96);
+                _failureAiPick.Items.Add(label);
+                if (previousKey.Length > 0 &&
+                    string.Equals(previousKey, FailureKey(request), StringComparison.Ordinal))
+                {
+                    selected = i;
+                }
+            }
+            _failureAiPick.Enabled = true;
+            _failureAiPick.SelectedIndex = selected;
+            if (!_failureAiBusy) _failureAiButton.Enabled = true;
+        }
+
+        private CurlRequest SelectedFailureRequest()
+        {
+            if (_failureAiPick == null) return null;
+            int index = _failureAiPick.SelectedIndex;
+            if (index < 0 || index >= _failureAiRequests.Count) return null;
+            return _failureAiRequests[index];
+        }
+
+        private static string FailureKey(CurlRequest request)
+        {
+            return (request.Method ?? "") + "\n" + request.Status + "\n" + (request.Url ?? "");
+        }
+
+        private static string ClipText(string value, int max)
+        {
+            if (string.IsNullOrEmpty(value) || max <= 0 || value.Length <= max) return value;
+            return value.Substring(0, max) + "…";
+        }
+
+        private static string FormatPerformance(List<CurlRequest> requests, bool mask)
+        {
+            if (requests == null || requests.Count == 0)
+            {
+                return "没有可统计的请求。\r\n\r\n" +
+                    "cURL 只有链接，没有耗时和状态信息；耗时统计需要 HAR（含 entry.time），请求列表 JSON 只能看到请求数和失败数。";
+            }
+
+            int failureCount = 0;
+            int timedCount = 0;
+            double totalMs = 0;
+            double maxMs = 0;
+            CurlRequest slowest = null;
+            List<CurlRequest> timed = new List<CurlRequest>();
+
+            foreach (CurlRequest request in requests)
+            {
+                if (request.IsFailure()) failureCount++;
+                if (request.TimeMs > 0)
+                {
+                    timedCount++;
+                    totalMs += request.TimeMs;
+                    timed.Add(request);
+                    if (request.TimeMs > maxMs)
+                    {
+                        maxMs = request.TimeMs;
+                        slowest = request;
+                    }
+                }
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("性能概览（按当前筛选）");
+            sb.AppendLine("  请求数: " + requests.Count);
+            sb.AppendLine("  失败数: " + failureCount);
+
+            if (timedCount > 0)
+            {
+                sb.AppendLine(string.Format(
+                    "  总耗时: {0:0} ms（{1} 条有耗时数据，平均 {2:0} ms）",
+                    totalMs, timedCount, totalMs / timedCount));
+                sb.AppendLine("  最慢: " + FormatPerformanceRequest(slowest, mask));
+            }
+            else
+            {
+                sb.AppendLine("  耗时: 当前内容没有耗时字段（cURL / 请求列表通常没有 entry.time）");
+            }
+            sb.AppendLine();
+
+            if (timedCount > 0)
+            {
+                timed.Sort(delegate(CurlRequest left, CurlRequest right)
+                {
+                    return right.TimeMs.CompareTo(left.TimeMs);
+                });
+                sb.AppendLine("慢请求 Top " + Math.Min(10, timed.Count));
+                int limit = Math.Min(10, timed.Count);
+                for (int i = 0; i < limit; i++)
+                {
+                    sb.AppendLine(string.Format(
+                        "  {0,2}. {1:0} ms  {2}",
+                        i + 1, timed[i].TimeMs, FormatPerformanceRequest(timed[i], mask)));
+                }
+                if (timed.Count > limit)
+                {
+                    sb.AppendLine("  …还有 " + (timed.Count - limit) + " 条有耗时数据的请求");
+                }
+                sb.AppendLine();
+            }
+
+            Dictionary<string, DomainPerformance> domains =
+                new Dictionary<string, DomainPerformance>(StringComparer.OrdinalIgnoreCase);
+            foreach (CurlRequest request in requests)
+            {
+                string host = HostOf(request.Url ?? "");
+                if (string.IsNullOrEmpty(host) || string.Equals(host, request.Url, StringComparison.Ordinal))
+                {
+                    host = "(未知域名)";
+                }
+                DomainPerformance stat;
+                if (!domains.TryGetValue(host, out stat))
+                {
+                    stat = new DomainPerformance();
+                    domains[host] = stat;
+                }
+                stat.Count++;
+                if (request.IsFailure()) stat.Failures++;
+                if (request.TimeMs > 0)
+                {
+                    stat.Timed++;
+                    stat.TotalMs += request.TimeMs;
+                    if (request.TimeMs > stat.MaxMs) stat.MaxMs = request.TimeMs;
+                }
+            }
+
+            List<KeyValuePair<string, DomainPerformance>> domainList =
+                new List<KeyValuePair<string, DomainPerformance>>(domains);
+            domainList.Sort(delegate(
+                KeyValuePair<string, DomainPerformance> left,
+                KeyValuePair<string, DomainPerformance> right)
+            {
+                int byMax = right.Value.MaxMs.CompareTo(left.Value.MaxMs);
+                if (byMax != 0) return byMax;
+                int byCount = right.Value.Count.CompareTo(left.Value.Count);
+                if (byCount != 0) return byCount;
+                return string.Compare(left.Key, right.Key, StringComparison.OrdinalIgnoreCase);
+            });
+
+            sb.AppendLine("按域名聚合（" + domains.Count + " 个域名）");
+            int shown = Math.Min(30, domainList.Count);
+            for (int i = 0; i < shown; i++)
+            {
+                string host = domainList[i].Key;
+                DomainPerformance stat = domainList[i].Value;
+                if (stat.Timed > 0)
+                {
+                    sb.AppendLine(string.Format(
+                        "  {0}: {1} 个请求，失败 {2}，平均 {3:0} ms，最大 {4:0} ms",
+                        host, stat.Count, stat.Failures, stat.TotalMs / stat.Timed, stat.MaxMs));
+                }
+                else
+                {
+                    sb.AppendLine(string.Format(
+                        "  {0}: {1} 个请求，失败 {2}（没有耗时数据）",
+                        host, stat.Count, stat.Failures));
+                }
+            }
+            if (domainList.Count > shown)
+            {
+                sb.AppendLine("  …还有 " + (domainList.Count - shown) + " 个域名未显示");
+            }
+
+            return sb.ToString().TrimEnd();
+        }
+
+        private static string FormatPerformanceRequest(CurlRequest request, bool mask)
+        {
+            if (request == null) return "";
+            string url = mask ? Sensitive.MaskUrl(request.Url ?? "") : (request.Url ?? "");
+            StringBuilder sb = new StringBuilder();
+            sb.Append((request.Method ?? "GET") + " ");
+            sb.Append(ClipText(url, 160));
+            if (!string.IsNullOrEmpty(request.Error))
+            {
+                sb.Append("  [" + ClipText(request.Error, 80) + "]");
+            }
+            else if (request.Status > 0)
+            {
+                sb.Append("  [" + request.Status);
+                if (!string.IsNullOrEmpty(request.StatusText))
+                {
+                    sb.Append(" " + ClipText(request.StatusText, 40));
+                }
+                sb.Append("]");
+            }
+            return sb.ToString();
+        }
+
+        private const string FailureDiagnosisSystemPrompt =
+            "你是资深 Java 后端、前端联调和 SRE，擅长定位 HTTP 接口失败。\n" +
+            "只根据用户给出的请求和响应判断，不要假设看不到的服务端实现。\n" +
+            "输出中文，严格按下面结构：\n" +
+            "一句话结论\n" +
+            "关键事实\n" +
+            "可能原因（按可能性从高到低，每条带依据）\n" +
+            "下一步怎么验证（可直接执行的命令或操作）\n" +
+            "如果信息不足，明确说还需要看什么。\n" +
+            "敏感字段已用 *** 打码，不要要求用户提供真实 Token、Cookie 或密码。";
+
+        private void DiagnoseFailureWithAi()
+        {
+            if (_failureAiBusy) return;
+            CurlRequest request = SelectedFailureRequest();
+            if (request == null)
+            {
+                SetStatus("先在「诊断请求」下拉里选一条失败请求。", ErrorColor);
+                return;
+            }
+
+            if (_aiSettings == null) _aiSettings = AiOcrSettings.Load();
+            if (!_aiSettings.IsConfigured)
+            {
+                SetStatus("AI 诊断需要先配置接口和 API Key。", MutedColor);
+                if (!ShowAiSettings() || _aiSettings == null || !_aiSettings.IsConfigured)
+                {
+                    SetStatus("AI 还没配置，诊断已取消。", MutedColor);
+                    return;
+                }
+            }
+
+            AiOcrSettings settings = _aiSettings;
+            string host = HostOf(settings.BaseUrl);
+            string userPrompt = BuildFailureDiagnosisPrompt(request);
+            int generation = ++_failureAiGeneration;
+            _failureAiBusy = true;
+            _failureAiButton.Enabled = false;
+            _failureAiButton.Text = "诊断中…";
+            SetStatus("正在把打码后的请求发给 " + host + " 诊断…", MutedColor);
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string text = "";
+                string error = "";
+                bool ok = false;
+                try
+                {
+                    ok = AiOcrRunner.TryChat(
+                        settings, FailureDiagnosisSystemPrompt, userPrompt, out text, out error);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed || Disposing) return;
+                        if (generation != _failureAiGeneration) return;
+
+                        _failureAiBusy = false;
+                        if (_failureAiButton != null)
+                        {
+                            _failureAiButton.Text = "AI 诊断（联网）";
+                            _failureAiButton.Enabled = _failureAiRequests.Count > 0;
+                        }
+                        if (ok)
+                        {
+                            SetStatus("AI 诊断完成（" + host + "）。", OkColor);
+                            ShowDiagnosisDialog(request, text, host);
+                        }
+                        else
+                        {
+                            SetStatus("AI 诊断失败：" + error, ErrorColor);
+                        }
+                    });
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        }
+
+        private string BuildFailureDiagnosisPrompt(CurlRequest request)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("请诊断下面这条 HTTP 请求为什么失败。");
+            sb.AppendLine("请求方法: " + (request.Method ?? "GET"));
+            sb.AppendLine("URL: " + (_lastMask ? Sensitive.MaskUrl(request.Url ?? "") : (request.Url ?? "")));
+            if (request.Status > 0)
+            {
+                sb.AppendLine("状态码: " + request.Status +
+                    (string.IsNullOrEmpty(request.StatusText) ? "" : " " + request.StatusText));
+            }
+            else
+            {
+                sb.AppendLine("状态码: 无响应");
+            }
+            if (!string.IsNullOrEmpty(request.Error))
+            {
+                sb.AppendLine("错误: " + request.Error);
+            }
+            if (request.TimeMs > 0)
+            {
+                sb.AppendLine(string.Format("耗时: {0:0} ms", request.TimeMs));
+            }
+            sb.AppendLine();
+
+            sb.AppendLine("请求头:");
+            AppendDiagnosisHeaders(sb, request.Headers, false);
+            sb.AppendLine();
+            sb.AppendLine("请求体:");
+            AppendDiagnosisBody(sb, request.Body, 5000);
+            sb.AppendLine();
+
+            if (request.HasResponse())
+            {
+                sb.AppendLine("响应头:");
+                AppendDiagnosisHeaders(sb, request.ResponseHeaders, true);
+                sb.AppendLine();
+                sb.AppendLine("响应体:");
+                AppendDiagnosisBody(sb, request.ResponseBody, 7000);
+            }
+            else
+            {
+                sb.AppendLine("响应:");
+                sb.AppendLine("  （这份内容没有响应信息，只能从请求侧判断）");
+            }
+
+            string prompt = sb.ToString();
+            if (prompt.Length > 20000)
+            {
+                prompt = prompt.Substring(0, 20000) + "\r\n\r\n（内容过长，已截断）";
+            }
+            return prompt;
+        }
+
+        private void AppendDiagnosisHeaders(
+            StringBuilder sb, List<KeyValuePair<string, string>> headers, bool response)
+        {
+            int written = 0;
+            int omitted = 0;
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (KeyValuePair<string, string> pair in headers)
+            {
+                string name = (pair.Key ?? "").Trim();
+                if (name.Length == 0) continue;
+                if (response
+                    ? Sensitive.IsNoiseResponseHeader(name)
+                    : Sensitive.IsNoiseRequestHeader(name))
+                {
+                    omitted++;
+                    continue;
+                }
+                string value = pair.Value ?? "";
+                if (!seen.Add(name.ToLowerInvariant() + "\n" + value))
+                {
+                    omitted++;
+                    continue;
+                }
+                if (written >= 40)
+                {
+                    omitted++;
+                    continue;
+                }
+                string display = _lastMask ? Sensitive.MaskHeader(name, value) : value;
+                sb.AppendLine("  " + name + ": " + ClipText(display, 500));
+                written++;
+            }
+            if (written == 0) sb.AppendLine("  （无）");
+            if (omitted > 0) sb.AppendLine("  （已省略 " + omitted + " 个通用头或重复头）");
+        }
+
+        private void AppendDiagnosisBody(StringBuilder sb, string body, int maxLength)
+        {
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                sb.AppendLine("  （无）");
+                return;
+            }
+            string text = _lastMask ? Sensitive.MaskBody(body) : body;
+            if (text.Length > maxLength)
+            {
+                text = text.Substring(0, maxLength) + "\n…（已截断）";
+            }
+            string trimmed = text.TrimStart();
+            if (trimmed.StartsWith("{") || trimmed.StartsWith("["))
+            {
+                try
+                {
+                    text = JsonPretty.Print(text);
+                }
+                catch (Exception)
+                {
+                }
+            }
+            text = text.Replace("\r\n", "\n").Replace('\r', '\n');
+            sb.AppendLine("  " + text.Replace("\n", "\n  "));
+        }
+
+        private void ShowDiagnosisDialog(CurlRequest request, string text, string host)
+        {
+            using (Form dialog = new Form())
+            {
+                dialog.Text = "AI 请求诊断 - " + (request.Method ?? "GET") +
+                    (request.Status > 0 ? " " + request.Status : "");
+                dialog.ClientSize = new Size(760, 620);
+                dialog.MinimumSize = new Size(560, 420);
+                dialog.StartPosition = FormStartPosition.CenterParent;
+                dialog.Font = Font;
+                dialog.BackColor = Color.White;
+                dialog.ShowIcon = false;
+                dialog.MinimizeBox = false;
+
+                TableLayoutPanel layout = new TableLayoutPanel();
+                layout.Dock = DockStyle.Fill;
+                layout.ColumnCount = 1;
+                layout.RowCount = 3;
+                layout.Padding = new Padding(14);
+                layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                Label note = new Label();
+                note.Text = "AI 诊断结果（发送到 " + host + "，Token / Cookie 等已打码）";
+                note.AutoSize = true;
+                note.ForeColor = MutedColor;
+                note.Margin = new Padding(0, 0, 0, 8);
+
+                TextBox box = new TextBox();
+                box.Multiline = true;
+                box.ReadOnly = true;
+                box.WordWrap = true;
+                box.ScrollBars = ScrollBars.Vertical;
+                box.Font = new Font("Microsoft YaHei UI", 9.5F);
+                box.BackColor = Color.White;
+                box.ForeColor = TitleColor;
+                box.BorderStyle = BorderStyle.FixedSingle;
+                box.Dock = DockStyle.Fill;
+                box.Text = text;
+                box.Margin = new Padding(0);
+                AttachOutputMenu(box, false);
+
+                FlowLayoutPanel buttons = new FlowLayoutPanel();
+                buttons.FlowDirection = FlowDirection.RightToLeft;
+                buttons.WrapContents = false;
+                buttons.AutoSize = true;
+                buttons.Dock = DockStyle.Fill;
+                buttons.Margin = new Padding(0, 8, 0, 0);
+
+                Button close = MakeSmallButton("关闭", 72);
+                close.Click += delegate { dialog.Close(); };
+
+                Button copy = MakeSmallButton("复制结果", 88);
+                copy.Click += delegate
+                {
+                    try
+                    {
+                        SetClipboardText(box.Text);
+                        copy.Text = "已复制";
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(dialog, "复制失败：" + ex.Message, "curl2url",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                };
+
+                buttons.Controls.Add(close);
+                buttons.Controls.Add(copy);
+                layout.Controls.Add(note, 0, 0);
+                layout.Controls.Add(box, 0, 1);
+                layout.Controls.Add(buttons, 0, 2);
+                dialog.Controls.Add(layout);
+                dialog.ShowDialog(this);
+            }
         }
 
         private TabPage BuildOcrPage()
@@ -1020,7 +2530,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
         private TabPage BuildLogPage()
         {
-            TabPage page = new TabPage("日志人话");
+            TabPage page = new TabPage("日志翻译");
             page.BackColor = Color.White;
             page.UseVisualStyleBackColor = false;
             page.Padding = new Padding(8);
@@ -1231,16 +2741,17 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             {
                 _rootLayout.RowStyles[2].SizeType = SizeType.Absolute;
                 _rootLayout.RowStyles[2].Height = 0F;
-                _rootLayout.RowStyles[4].SizeType = SizeType.Percent;
-                _rootLayout.RowStyles[4].Height = 100F;
+                _rootLayout.RowStyles[5].SizeType = SizeType.Percent;
+                _rootLayout.RowStyles[5].Height = 100F;
             }
             else
             {
                 _rootLayout.RowStyles[2].SizeType = SizeType.Percent;
                 _rootLayout.RowStyles[2].Height = 42F;
-                _rootLayout.RowStyles[4].SizeType = SizeType.Percent;
-                _rootLayout.RowStyles[4].Height = 58F;
+                _rootLayout.RowStyles[5].SizeType = SizeType.Percent;
+                _rootLayout.RowStyles[5].Height = 58F;
             }
+            UpdateFilterBarVisibility();
             _rootLayout.PerformLayout();
             if (logActive && _logInput != null) _logInput.Focus();
         }
@@ -1462,10 +2973,15 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             string text = _inputBox.Text;
             if (string.IsNullOrWhiteSpace(text))
             {
+                InvalidateAnalysis();
                 _resultBox.Text = "";
                 _detailBox.Text = "";
                 _failureBox.Text = "";
+                if (_performanceBox != null) _performanceBox.Text = "";
                 _failurePage.Text = "失败请求";
+                ClearParsedData();
+                ResetFilters();
+                _lastAnalyzedText = "";
                 _lastSignature = "";
                 SetStatus("就绪", MutedColor);
                 return;
@@ -1476,150 +2992,243 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             string signature = (keepDuplicates ? "1" : "0") + (mask ? "1" : "0") + "|" + text;
             if (auto && signature == _lastSignature) return;
 
-            bool isHar = HarParser.LooksLikeHar(text);
-            bool isList = !isHar && RequestListParser.LooksLikeRequestList(text);
-            List<CurlRequest> requests;
-            List<string> allUrls;
-            string harWarning = "";
-
-            try
+            if (_analysisWorkerRunning)
             {
-                if (isHar || isList)
+                // 解析线程不能强杀；先标记最新内容，等当前线程结束后自动再解析一次
+                _analysisPending = true;
+                _analysisGeneration++;
+                _lastSignature = signature;
+                SetStatus(
+                    _analysisBusy
+                        ? "正在解析，已排队最新内容…"
+                        : "正在结束上一次解析，完成后会自动解析最新内容…",
+                    MutedColor);
+                return;
+            }
+
+            ParseOutcome outcome = new ParseOutcome();
+            outcome.Generation = ++_analysisGeneration;
+            outcome.Text = text;
+            outcome.Signature = signature;
+            outcome.Mask = mask;
+            outcome.KeepDuplicates = keepDuplicates;
+
+            _lastSignature = signature;
+            _analysisWorkerRunning = true;
+            _analysisBusyGeneration = outcome.Generation;
+            SetAnalysisBusy(true);
+            SetStatus(string.Format("正在解析 {0} 个字符…", text.Length), MutedColor);
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
                 {
-                    requests = isHar ? HarParser.Parse(text, out harWarning) : RequestListParser.Parse(text);
-                    allUrls = new List<string>();
-                    foreach (CurlRequest request in requests)
+                    outcome.IsHar = HarParser.LooksLikeHar(text);
+                    outcome.IsList = !outcome.IsHar && RequestListParser.LooksLikeRequestList(text);
+                    if (outcome.IsHar || outcome.IsList)
                     {
-                        if (!string.IsNullOrEmpty(request.Url)) allUrls.Add(request.Url);
+                        string warning = "";
+                        outcome.Requests = outcome.IsHar
+                            ? HarParser.Parse(text, out warning)
+                            : RequestListParser.Parse(text);
+                        outcome.HarWarning = warning;
+                        outcome.AllUrls = new List<string>();
+                        foreach (CurlRequest request in outcome.Requests)
+                        {
+                            if (!string.IsNullOrEmpty(request.Url)) outcome.AllUrls.Add(request.Url);
+                        }
                     }
+                    else
+                    {
+                        outcome.AllUrls = UrlExtractor.Extract(text);
+                        outcome.Requests = UrlExtractor.ParseRequests(text);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    outcome.Error = ex;
+                }
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate { CompleteAnalysis(outcome); });
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        }
+
+        private void InvalidateAnalysis()
+        {
+            _analysisGeneration++;
+            _analysisPending = false;
+            if (_analysisBusy) SetAnalysisBusy(false);
+        }
+
+        private void CancelAnalysis()
+        {
+            if (!_analysisBusy && !_analysisWorkerRunning) return;
+            _analysisGeneration++;
+            _analysisPending = false;
+            if (_analysisBusy) SetAnalysisBusy(false);
+            SetStatus("已取消解析；正在后台结束旧任务，可以继续编辑或粘贴。", MutedColor);
+        }
+
+        private void SetAnalysisBusy(bool busy)
+        {
+            _analysisBusy = busy;
+            if (_cancelAnalyzeButton != null) _cancelAnalyzeButton.Visible = busy;
+        }
+
+        private void CompleteAnalysis(ParseOutcome outcome)
+        {
+            if (IsDisposed || Disposing) return;
+
+            _analysisWorkerRunning = false;
+            if (_analysisBusy && _analysisBusyGeneration == outcome.Generation)
+            {
+                SetAnalysisBusy(false);
+            }
+
+            bool stale = outcome.Generation != _analysisGeneration;
+            if (!stale && !string.Equals(_inputBox.Text, outcome.Text, StringComparison.Ordinal))
+            {
+                // 解析期间用户又改了内容：旧结果不能覆盖新输入，排一次新的解析
+                stale = true;
+                _analysisPending = true;
+            }
+
+            if (!stale)
+            {
+                if (outcome.Error != null)
+                {
+                    ShowAnalysisError(outcome);
                 }
                 else
                 {
-                    allUrls = UrlExtractor.Extract(text);
-                    requests = UrlExtractor.ParseRequests(text);
+                    List<string> uniqueUrls = UrlExtractor.Unique(outcome.AllUrls);
+                    List<string> urls = outcome.KeepDuplicates ? outcome.AllUrls : uniqueUrls;
+                    if (urls.Count == 0)
+                    {
+                        _resultBox.Text = "";
+                        _detailBox.Text = "";
+                        _failureBox.Text = "";
+                        if (_performanceBox != null) _performanceBox.Text = "";
+                        _failurePage.Text = "失败请求";
+                        ClearParsedData();
+                        ResetFilters();
+                        _lastAnalyzedText = "";
+                        _lastSignature = outcome.Signature;
+                        SetStatus(
+                            outcome.IsHar
+                                ? "HAR 里没有请求记录。"
+                                : (outcome.IsList
+                                    ? "请求列表 JSON 里没有可用 URL。"
+                                    : "没有找到 URL，请确认内容里包含 curl 命令、HAR JSON 或完整链接。"),
+                            ErrorColor);
+                    }
+                    else
+                    {
+                        ApplyParsedOutcome(outcome, uniqueUrls, urls);
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                string failureTitle = isHar
-                    ? "HAR 解析失败"
-                    : (isList ? "JSON 解析失败" : "解析失败");
-                string failureHint = isHar
-                    ? "如果是复制粘贴的 HAR，内容可能被截断或不是完整 JSON；建议点「打开 HAR 文件」，或把 .har 文件拖进窗口。"
-                    : (isList
-                        ? "如果是复制粘贴的请求列表 JSON，内容可能被截断或不是完整 JSON；建议把 .json 文件拖进窗口。"
-                        : "请确认内容是完整的 curl 命令、HAR JSON 或请求列表 JSON。");
 
-                _resultBox.Text = "";
-                _failureBox.Text = "";
-                _failurePage.Text = "失败请求";
-                _detailBox.Text =
-                    failureTitle + "\r\n\r\n" +
-                    ex.Message + "\r\n\r\n" +
-                    "已接收 " + text.Length + " 个字符。\r\n" + failureHint;
-                _lastSignature = "";
-                SetStatus(failureTitle + "（详情见第二个页签）", ErrorColor);
-                return;
-            }
-
-            List<string> uniqueUrls = UrlExtractor.Unique(allUrls);
-            List<string> urls = keepDuplicates ? allUrls : uniqueUrls;
-
-            if (urls.Count == 0)
+            if (_analysisPending)
             {
-                _resultBox.Text = "";
-                _detailBox.Text = "";
-                _failureBox.Text = "";
-                _failurePage.Text = "失败请求";
-                _lastSignature = signature;
-                SetStatus(
-                    isHar
-                        ? "HAR 里没有请求记录。"
-                        : (isList
-                            ? "请求列表 JSON 里没有可用 URL。"
-                            : "没有找到 URL，请确认内容里包含 curl 命令、HAR JSON 或完整链接。"),
-                    ErrorColor);
-                return;
+                _analysisPending = false;
+                Analyze(false);
             }
+        }
 
-            List<string> displayUrls = new List<string>();
-            foreach (string url in urls)
-            {
-                displayUrls.Add(mask ? Sensitive.MaskUrl(url) : url);
-            }
-            _resultBox.Text = string.Join("\r\n", displayUrls.ToArray());
+        private void ShowAnalysisError(ParseOutcome outcome)
+        {
+            string failureTitle = outcome.IsHar
+                ? "HAR 解析失败"
+                : (outcome.IsList ? "JSON 解析失败" : "解析失败");
+            string failureHint = outcome.IsHar
+                ? "如果是复制粘贴的 HAR，内容可能被截断或不是完整 JSON；建议点「打开 HAR 文件」，或把 .har 文件拖进窗口。"
+                : (outcome.IsList
+                    ? "如果是复制粘贴的请求列表 JSON，内容可能被截断或不是完整 JSON；建议把 .json 文件拖进窗口。"
+                    : "请确认内容是完整的 curl 命令、HAR JSON 或请求列表 JSON。");
 
-            try
-            {
-                string detailsText = UrlExtractor.FormatDetails(
-                    requests, allUrls, mask, _keepResponses.Checked);
-                if (harWarning.Length > 0)
-                {
-                    detailsText = "注意：" + harWarning + "\r\n\r\n" + detailsText;
-                }
-                _detailBox.Text = detailsText;
-            }
-            catch (Exception ex)
-            {
-                _detailBox.Text = "解析详情失败：" + ex.Message;
-            }
+            _resultBox.Text = "";
+            _failureBox.Text = "";
+            if (_performanceBox != null) _performanceBox.Text = "";
+            _failurePage.Text = "失败请求";
+            _detailBox.Text =
+                failureTitle + "\r\n\r\n" +
+                outcome.Error.Message + "\r\n\r\n" +
+                "已接收 " + outcome.Text.Length + " 个字符。\r\n" + failureHint;
+            ClearParsedData();
+            ResetFilters();
+            _lastAnalyzedText = "";
+            _lastSignature = "";
+            SetStatus(failureTitle + "（详情见第二个页签）", ErrorColor);
+        }
+
+        private void ApplyParsedOutcome(ParseOutcome outcome, List<string> uniqueUrls, List<string> urls)
+        {
+            // 只解析一次：筛选条件变化时复用这里的请求列表，重新渲染结果。
+            bool contentChanged = !string.Equals(_lastAnalyzedText, outcome.Text, StringComparison.Ordinal);
+            _lastAnalyzedText = outcome.Text;
+            if (contentChanged) ResetFilters();
+            _lastRequests = outcome.Requests;
+            _lastAllUrls = outcome.AllUrls;
+            _lastMask = outcome.Mask;
+            _lastKeepDuplicates = outcome.KeepDuplicates;
+            _lastHarWarning = outcome.HarWarning;
+            _lastHasParsed = true;
+            RefreshFilterChoices();
+            ApplyFilterView();
 
             int failureCount = 0;
-            for (int i = 0; i < requests.Count; i++)
+            for (int i = 0; i < outcome.Requests.Count; i++)
             {
-                if (requests[i].IsFailure()) failureCount++;
+                if (outcome.Requests[i].IsFailure()) failureCount++;
             }
-
-            try
-            {
-                _failureBox.Text = UrlExtractor.FormatFailures(requests, mask);
-            }
-            catch (Exception ex)
-            {
-                _failureBox.Text = "解析失败请求失败：" + ex.Message;
-            }
-
-            _failurePage.Text = failureCount > 0
-                ? "失败请求 (" + failureCount + ")"
-                : "失败请求";
 
             string summary;
-            if (requests.Count > 0)
+            if (outcome.Requests.Count > 0)
             {
-                summary = keepDuplicates
-                    ? string.Format("来自 {0} 个请求，共 {1} 条 URL（含重复）", requests.Count, urls.Count)
-                    : string.Format("来自 {0} 个请求，{1} 个不同 URL", requests.Count, uniqueUrls.Count);
+                summary = outcome.KeepDuplicates
+                    ? string.Format("来自 {0} 个请求，共 {1} 条 URL（含重复）", outcome.Requests.Count, urls.Count)
+                    : string.Format("来自 {0} 个请求，{1} 个不同 URL", outcome.Requests.Count, uniqueUrls.Count);
             }
             else
             {
                 summary = string.Format("提取到 {0} 个 URL", urls.Count);
             }
 
-            if (isHar) summary = (harWarning.Length > 0 ? "HAR（部分损坏）：" : "HAR：") + summary;
-            else if (isList) summary = "请求列表：" + summary;
+            if (outcome.IsHar) summary = (outcome.HarWarning.Length > 0 ? "HAR（部分损坏）：" : "HAR：") + summary;
+            else if (outcome.IsList) summary = "请求列表：" + summary;
             if (failureCount > 0) summary += string.Format("，失败 {0} 个", failureCount);
-            if (mask) summary += "（长参数已隐藏）";
+            if (outcome.Mask) summary += "（长参数已隐藏）";
 
             bool websocketNoise =
-                !keepDuplicates &&
-                requests.Count > 1 &&
+                !outcome.KeepDuplicates &&
+                outcome.Requests.Count > 1 &&
                 uniqueUrls.Count == 1 &&
                 IsWebSocketUrl(urls[0]);
 
-            _lastSignature = signature;
+            _lastSignature = outcome.Signature;
 
             if (websocketNoise)
             {
                 SetStatus(string.Format(
                     "{0} 条 WS 握手指向同一地址；要接口路径，请在 Network 面板切到 XHR 后重新复制",
-                    requests.Count), MutedColor);
+                    outcome.Requests.Count), MutedColor);
             }
             else
             {
-                string done = harWarning.Length > 0 ? "，已按可用部分解析" : "，已自动解析";
+                string done = outcome.HarWarning.Length > 0 ? "，已按可用部分解析" : "，已自动解析";
                 SetStatus(summary + done, failureCount > 0
                     ? ErrorColor
-                    : (harWarning.Length > 0 ? MutedColor : OkColor));
+                    : (outcome.HarWarning.Length > 0 ? MutedColor : OkColor));
             }
         }
 
@@ -1655,26 +3264,6 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
                     SetStatus("读取文件失败：" + ex.Message, ErrorColor);
                 }
             }
-        }
-
-        private void ShowOcrPage(bool tryClipboardImage)
-        {
-            if (_tabs != null && _ocrPage != null) _tabs.SelectedTab = _ocrPage;
-            if (!tryClipboardImage) return;
-
-            if (_ocrBusy)
-            {
-                SetOcrStatus("正在识别上一张图片，请稍候。", MutedColor);
-                return;
-            }
-
-            Bitmap image = TryGetClipboardImage();
-            if (image != null)
-            {
-                StartOcr(image, "剪贴板图片");
-                return;
-            }
-            SetOcrStatus("剪贴板里没有图片。截图后按 Ctrl+V，或点「打开图片」。", MutedColor);
         }
 
         private void PasteImageFromClipboard()
@@ -2074,10 +3663,29 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
         internal string RunLogUiSelftest()
         {
+            _suppressUiStateSave = true;
             if (_tabs == null || _logPage == null || _logInput == null || _logOutput == null ||
                 _logStatusLabel == null || _logOnlyErrors == null)
             {
                 return "日志页控件没有创建";
+            }
+            if (_logPage.Text != "日志翻译") return "日志页签名称不是「日志翻译」";
+            if (_tabs.TabPages.Count != 7) return "页签数量不是 7 个：" + _tabs.TabPages.Count;
+            if (_performancePage == null || _performanceBox == null ||
+                _failureAiPick == null || _failureAiButton == null)
+            {
+                return "性能页或失败请求 AI 诊断控件没有创建";
+            }
+            if (_tabs.TabPages[3] != _performancePage) return "性能页签位置不正确";
+            if (_versionLabel == null || _versionLabel.Text != "v" + CurrentVersionText())
+                return "版本号没有显示";
+            if (_curlToolbar != null)
+            {
+                foreach (Control control in _curlToolbar.Controls)
+                {
+                    if (control is Button && control.Text == "截图识别")
+                        return "工具栏仍然保留重复的「截图识别」按钮";
+                }
             }
 
             _tabs.SelectedTab = _logPage;
@@ -2140,9 +3748,196 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             if (fullDetails.IndexOf("X-Trace-Id", traceIndex + 1, StringComparison.Ordinal) >= 0)
                 return "重复响应头没有合并";
 
+            if (_filterBar == null || _filterKeyword == null || _filterHost == null ||
+                _filterMethod == null || _filterStatus == null || _filterSummary == null)
+            {
+                return "请求筛选控件没有创建";
+            }
+
+            CurlRequest orderRequest = new CurlRequest();
+            orderRequest.Source = "har";
+            orderRequest.Url = "https://api.one.com/orders?x=1";
+            orderRequest.Method = "GET";
+            orderRequest.Status = 200;
+            orderRequest.TimeMs = 120;
+            CurlRequest payRequest = new CurlRequest();
+            payRequest.Source = "har";
+            payRequest.Url = "https://api.two.com/pay";
+            payRequest.Method = "POST";
+            payRequest.Status = 500;
+            payRequest.StatusText = "Server Error";
+            payRequest.TimeMs = 2500;
+
+            _lastRequests = new List<CurlRequest>();
+            _lastRequests.Add(orderRequest);
+            _lastRequests.Add(payRequest);
+            _lastAllUrls = new List<string>();
+            _lastAllUrls.Add(orderRequest.Url);
+            _lastAllUrls.Add(payRequest.Url);
+            _lastMask = true;
+            _lastKeepDuplicates = false;
+            _lastHarWarning = "";
+            _lastHasParsed = true;
+            ResetFilters();
+            RefreshFilterChoices();
+
+            _filterKeyword.Text = "pay";
+            _filterHost.Text = "api.two.com";
+            int postIndex = -1;
+            for (int i = 1; i < _filterMethod.Items.Count; i++)
+            {
+                if (string.Equals(_filterMethod.Items[i].ToString(), "POST", StringComparison.Ordinal))
+                {
+                    postIndex = i;
+                    break;
+                }
+            }
+            if (postIndex < 0) return "方法筛选没有列出 POST";
+            _filterMethod.SelectedIndex = postIndex;
+            _filterStatus.Text = "5xx 服务端错误";
+            ApplyFilterView();
+            if (_resultBox.Text != "https://api.two.com/pay")
+                return "请求筛选没有只保留匹配的 URL：" + _resultBox.Text;
+            if (_filterSummary.Text.IndexOf("1 / 2", StringComparison.Ordinal) < 0)
+                return "请求筛选的计数不正确：" + _filterSummary.Text;
+
+            _filterKeyword.Text = "";
+            _filterHost.Text = "全部域名";
+            _filterMethod.SelectedIndex = 0;
+            _filterStatus.Text = "4xx 客户端错误";
+            ApplyFilterView();
+            if (!_detailBox.Text.Contains("没有匹配的请求"))
+                return "筛选无结果时没有提示";
+
+            ClearFilters();
+            if (!_resultBox.Text.Contains("https://api.one.com/orders?x=1") ||
+                !_resultBox.Text.Contains("https://api.two.com/pay"))
+            {
+                return "清除筛选后没有恢复全部 URL";
+            }
+            if (_filterSummary.Text.IndexOf("共 2 个请求", StringComparison.Ordinal) < 0)
+                return "清除筛选后的计数不正确：" + _filterSummary.Text;
+
+            string performance = FormatPerformance(_lastRequests, true);
+            if (!performance.Contains("性能概览") || !performance.Contains("慢请求 Top"))
+                return "性能页缺少概览或慢请求列表";
+            if (!performance.Contains("api.two.com") || !performance.Contains("2500 ms"))
+                return "性能页没有统计最慢请求";
+            int slowSection = performance.IndexOf("慢请求 Top", StringComparison.Ordinal);
+            if (slowSection < 0) return "性能页缺少慢请求列表";
+            int slow2500 = performance.IndexOf("2500 ms", slowSection, StringComparison.Ordinal);
+            int slow120 = performance.IndexOf("120 ms", slowSection, StringComparison.Ordinal);
+            if (slow2500 < 0 || slow120 < 0 || slow2500 > slow120)
+                return "性能页慢请求没有按耗时降序";
+
+            RefreshFailureChoices(_lastRequests);
+            if (!_failureAiPick.Enabled || _failureAiPick.Items.Count != 1)
+                return "失败请求下拉没有列出唯一失败请求";
+            CurlRequest failureChoice = SelectedFailureRequest();
+            if (failureChoice == null || failureChoice.Url != payRequest.Url)
+                return "失败请求下拉选中的不是失败请求";
+
+            CurlRequest diagnosisRequest = new CurlRequest();
+            diagnosisRequest.Source = "har";
+            diagnosisRequest.Url = "https://api.two.com/pay?accessToken=SECRET123456";
+            diagnosisRequest.Method = "POST";
+            diagnosisRequest.Status = 500;
+            diagnosisRequest.StatusText = "Server Error";
+            diagnosisRequest.Headers.Add(
+                new KeyValuePair<string, string>("Authorization", "Bearer SECRET123456"));
+            diagnosisRequest.Headers.Add(
+                new KeyValuePair<string, string>("User-Agent", "Mozilla/5.0 noise"));
+            diagnosisRequest.Body = "{\"mobile\":\"15219896454\",\"token\":\"SECRET123456\"}";
+            diagnosisRequest.ResponseHeaders.Add(
+                new KeyValuePair<string, string>("Content-Type", "application/json"));
+            diagnosisRequest.ResponseBody = "{\"code\":500,\"password\":\"SECRET123456\"}";
+            string diagnosisPrompt = BuildFailureDiagnosisPrompt(diagnosisRequest);
+            if (diagnosisPrompt.Contains("SECRET123456"))
+                return "AI 诊断提示词没有打码敏感信息";
+            if (diagnosisPrompt.Contains("User-Agent"))
+                return "AI 诊断提示词没有过滤通用请求头";
+            if (!diagnosisPrompt.Contains("***"))
+                return "AI 诊断提示词没有显示打码标记";
+
+            ClearParsedData();
+            ResetFilters();
+
+            string asyncError = RunAsyncParseSelftest();
+            if (asyncError.Length > 0) return asyncError;
+
             _tabs.SelectedIndex = 0;
             UpdateWorkspaceForTab();
             if (_rootLayout.RowStyles[2].Height <= 0F) return "切回其他页后 curl 输入区高度没有恢复";
+            return "";
+        }
+
+        private string RunAsyncParseSelftest()
+        {
+            string har =
+                "{\"log\":{\"version\":\"1.2\",\"entries\":[" +
+                "{\"time\":125,\"request\":{\"method\":\"GET\",\"url\":\"https://api.one.com/orders\",\"headers\":[]}," +
+                "\"response\":{\"status\":200,\"statusText\":\"OK\",\"headers\":[],\"content\":{\"text\":\"{}\"}}}," +
+                "{\"time\":2500,\"request\":{\"method\":\"POST\",\"url\":\"https://api.two.com/pay\",\"headers\":[]," +
+                "\"postData\":{\"text\":\"{\\\"token\\\":\\\"SECRET123\\\"}\"}}," +
+                "\"response\":{\"status\":500,\"statusText\":\"Server Error\",\"headers\":[],\"content\":{\"text\":\"{\\\"code\\\":500}\"}}}" +
+                "]}}";
+
+            _autoTimer.Stop();
+            _inputBox.Text = har;
+            Analyze(false);
+
+            int waited = 0;
+            while ((_analysisBusy || _analysisWorkerRunning) && waited < 8000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
+                waited += 15;
+            }
+            _autoTimer.Stop();
+
+            if (_analysisBusy || _analysisWorkerRunning)
+                return "异步解析没有在 8 秒内结束";
+            if (!_lastHasParsed)
+                return "异步解析没有产生结果：" + _statusLabel.Text;
+            if (!_resultBox.Text.Contains("https://api.one.com/orders") ||
+                !_resultBox.Text.Contains("https://api.two.com/pay"))
+            {
+                return "异步解析结果缺少 URL";
+            }
+            if (!_performanceBox.Text.Contains("慢请求 Top") ||
+                !_performanceBox.Text.Contains("2500 ms"))
+            {
+                return "异步解析后性能页没有更新";
+            }
+            if (!_failureAiPick.Enabled || _failureAiPick.Items.Count != 1)
+                return "异步解析后失败请求下拉没有更新";
+
+            // 取消后不能把新内容的结果回填到界面
+            string cancelHar =
+                "{\"log\":{\"version\":\"1.2\",\"entries\":[" +
+                "{\"time\":9999,\"request\":{\"method\":\"GET\",\"url\":\"https://api.three.com/cancel\",\"headers\":[]}," +
+                "\"response\":{\"status\":500,\"statusText\":\"Server Error\",\"headers\":[],\"content\":{\"text\":\"{}\"}}}" +
+                "]}}";
+            _inputBox.Text = cancelHar;
+            Analyze(false);
+            CancelAnalysis();
+            _autoTimer.Stop();
+            if (_analysisBusy) return "取消解析后仍然显示解析中";
+
+            int cancelWait = 0;
+            while (_analysisWorkerRunning && cancelWait < 8000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
+                cancelWait += 15;
+            }
+            if (_analysisWorkerRunning) return "取消解析后后台任务没有结束";
+            if (_resultBox.Text.Contains("api.three.com"))
+                return "取消解析后仍然应用了旧结果";
+
+            ClearParsedData();
+            _inputBox.Text = "";
+            _autoTimer.Stop();
             return "";
         }
 
@@ -2402,12 +4197,17 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
         private void ClearAll()
         {
             _autoTimer.Stop();
+            InvalidateAnalysis();
             _lastSignature = "";
             _inputBox.Text = "";
             _resultBox.Text = "";
             _detailBox.Text = "";
             _failureBox.Text = "";
+            if (_performanceBox != null) _performanceBox.Text = "";
             _failurePage.Text = "失败请求";
+            ClearParsedData();
+            ResetFilters();
+            _lastAnalyzedText = "";
             SetStatus("就绪", MutedColor);
             _inputBox.Focus();
         }
