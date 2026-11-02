@@ -31,15 +31,8 @@ namespace Curl2Url
         private static readonly Font TreeCountFont = AppTheme.UiFont(8F);
         private static readonly Color TreeHoverBack = Color.FromArgb(245, 247, 250);
         private static readonly Color TreeDbDot = Color.FromArgb(82, 196, 26);
-        private static readonly Color[] TreeDbColors = new Color[]
-        {
-            Color.FromArgb(64, 158, 255),
-            Color.FromArgb(103, 194, 58),
-            Color.FromArgb(230, 162, 60),
-            Color.FromArgb(144, 147, 153),
-            Color.FromArgb(126, 87, 194),
-            Color.FromArgb(0, 168, 168)
-        };
+        // 所有库统一用同一个橙色，不按库名轮换颜色。
+        private static readonly Color TreeDbColor = Color.FromArgb(230, 162, 60);
 
         private readonly DatabaseTabHost _host;
         private readonly DatabaseConnectionProfile _profile;
@@ -868,7 +861,7 @@ namespace Curl2Url
 
             if (database != null)
             {
-                DrawDatabaseIcon(g, icon, TreeDbColors[node.Index % TreeDbColors.Length]);
+                DrawDatabaseIcon(g, icon, TreeDbColor);
                 textColor = AppTheme.TitleColor;
                 using (SolidBrush dot = new SolidBrush(TreeDbDot))
                     g.FillEllipse(dot, row.Right - 20, centerY - 3, 6, 6);
