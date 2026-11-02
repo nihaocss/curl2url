@@ -1,5 +1,7 @@
 # 编译中间产物
 *.new.exe
+curl2url.build.exe
+*.nupkg
 MakeIcon.exe
 MakeIconFromImage.exe
 *.pdb
@@ -12,3 +14,9 @@ obj/
 # 本地测试数据（含抓包内容，不要提交）
 *.har
 test/
+
+# 更新 exe 时留下的旧版本
+curl2url.prev.exe
+
+# AI 查询回归报告（可能含真实库表内容，只留本地）
+aitest-*

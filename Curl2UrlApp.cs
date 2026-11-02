@@ -22,9 +22,9 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyProduct("curl2url")]
 [assembly: System.Reflection.AssemblyCompany("lizhuoyu")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 lizhuoyu")]
-[assembly: System.Reflection.AssemblyVersion("1.0.13.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.13.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.13")]
+[assembly: System.Reflection.AssemblyVersion("1.0.23.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.23.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.23")]
 
 namespace Curl2Url
 {
@@ -33,6 +33,9 @@ namespace Curl2Url
         [STAThread]
         private static void Main(string[] args)
         {
+            // MySQL 驱动和依赖是 exe 内嵌资源，必须在任何 MySqlConnector 类型被 JIT 之前挂上解析器
+            EmbeddedAssemblies.Install();
+
             if (args.Length > 0)
             {
                 if (args[0] == "--extract")
@@ -67,6 +70,16 @@ namespace Curl2Url
                         Environment.Exit(2);
                     }
                     Environment.Exit(RunOcrAiOnly(args[1]));
+                }
+                if (args[0] == "--aitest")
+                {
+                    // 真实 AI + 真实数据库的查询回归，跑完有问题时进程返回 1
+                    Environment.Exit(DatabaseAiTest.Run(args));
+                }
+                if (args[0] == "--aitest-resume")
+                {
+                    // 上次因 AI 额度中断时，从断点继续，不重跑已经通过的题
+                    Environment.Exit(DatabaseAiTest.Run(args, true));
                 }
                 if (args[0] == "--selftest")
                 {
@@ -113,6 +126,12 @@ namespace Curl2Url
                         Environment.Exit(1);
                     }
                     RunLogSelftest();
+                    string databaseSelftestError = DatabaseSelftest.Run();
+                    if (databaseSelftestError.Length > 0)
+                    {
+                        WriteStderr("Database selftest failed: " + databaseSelftestError);
+                        Environment.Exit(1);
+                    }
                     Console.WriteLine("OK");
                     Environment.Exit(0);
                 }
@@ -457,7 +476,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
         }
     }
 
-    internal sealed class MainForm : Form
+    internal sealed partial class MainForm : Form
     {
         private static readonly Color PageBack = Color.FromArgb(245, 246, 248);
         private static readonly Color TitleColor = Color.FromArgb(48, 49, 51);
@@ -592,7 +611,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
         public MainForm()
         {
-            Text = "curl2url · cURL / HAR 解析 / 日志翻译";
+            Text = "curl2url · cURL / HAR 解析 / 日志翻译 / 数据库排查";
             ClientSize = new Size(900, 700);
             MinimumSize = new Size(760, 580);
             StartPosition = FormStartPosition.CenterScreen;
@@ -605,7 +624,16 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
             // 窗口位置 / 大小 / 上次所在页签在关闭时保存，下次启动恢复
             Load += delegate { LoadUiState(); };
-            FormClosing += delegate(object sender, FormClosingEventArgs e) { SaveUiState(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e)
+            {
+                if (!ConfirmFeatureClose())
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                SaveUiState();
+                ShutdownFeaturePages();
+            };
 
             // WinForms 窗体默认用框架自带图标，不会自动继承 exe 内嵌图标，
             // 这里显式取 exe 图标，标题栏 / 任务栏 / Alt+Tab 才会显示新图标
@@ -993,6 +1021,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             tabs.TabPages.Add(responsePage);
             tabs.TabPages.Add(_ocrPage);
             tabs.TabPages.Add(_logPage);
+            AppendFeatureTabs(tabs);
             tabs.SelectedIndexChanged += delegate { UpdateWorkspaceForTab(); };
             root.Controls.Add(tabs, 0, 5);
 
@@ -1990,15 +2019,18 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("性能概览（按当前筛选）");
-            sb.AppendLine("  请求数: " + requests.Count);
-            sb.AppendLine("  失败数: " + failureCount);
+            sb.AppendLine("  请求数: " + requests.Count + "    失败数: " + failureCount);
 
             if (timedCount > 0)
             {
+                double averageMs = totalMs / timedCount;
+
                 sb.AppendLine(string.Format(
-                    "  总耗时: {0:0} ms（{1} 条有耗时数据，平均 {2:0} ms）",
-                    totalMs, timedCount, totalMs / timedCount));
-                sb.AppendLine("  最慢: " + FormatPerformanceRequest(slowest, mask));
+                    "  总耗时: {0:0} ms（{1} 条有耗时）    平均 {2}",
+                    totalMs, timedCount, FormatMs(averageMs)));
+                sb.AppendLine("  最慢: " + FormatMs(maxMs) + "  " + FormatPerformanceRequest(slowest, mask));
+                sb.AppendLine();
+                AppendPerformanceDistribution(sb, timed, averageMs);
             }
             else
             {
@@ -2090,6 +2122,74 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             }
 
             return sb.ToString().TrimEnd();
+        }
+
+        // 接口耗时参考线（都含网络和排队时间，所以比纯服务端指标宽松）：
+        // < 100 ms 很快；100-300 ms 正常；300 ms-1 s 偏慢，先查 N+1 和慢 SQL；
+        // >= 1 s 慢，用户能明显感觉到；>= 3 s 基本可以当故障看。
+        private static void AppendPerformanceDistribution(
+            StringBuilder sb, List<CurlRequest> timed, double averageMs)
+        {
+            int[] counts = new int[4];
+            foreach (CurlRequest request in timed) counts[PerformanceBucket(request.TimeMs)]++;
+
+            // 只用 ASCII 字符画条：全角方块（█）在混合中文字体下会被放大成一整块黑，
+            // 而 '#' 在 Consolas 里宽度稳定，条与条之间也有留白。
+            const int BarWidth = 24;
+            string[] labels = { "< 100 ms   ", "100-300 ms ", "300-1000 ms", ">= 1000 ms " };
+            string[] grades = { "快  ", "正常", "偏慢", "慢  " };
+
+            int peak = 1;
+            for (int i = 0; i < counts.Length; i++)
+            {
+                if (counts[i] > peak) peak = counts[i];
+            }
+
+            sb.AppendLine("耗时分布（接口耗时，含网络）：");
+            for (int i = 0; i < counts.Length; i++)
+            {
+                double share = timed.Count == 0 ? 0 : counts[i] * 100.0 / timed.Count;
+                int bars = counts[i] == 0 ? 0 : Math.Max(1, (int)Math.Round(counts[i] * (double)BarWidth / peak));
+                sb.AppendLine(string.Format(
+                    "  {0}  {1}  {2,3} 条  {3,3:0}%  {4}",
+                    labels[i], grades[i], counts[i], share, new string('#', bars)));
+            }
+
+            sb.AppendLine("  参考线：< 100 ms 很快 · 100-300 ms 正常 · 300-1000 ms 偏慢 · >= 1000 ms 慢（>= 3 s 基本是故障）");
+            sb.AppendLine("  判定：" + PerformanceVerdict(averageMs, counts, timed.Count));
+        }
+
+        private static string PerformanceVerdict(double averageMs, int[] counts, int total)
+        {
+            string head;
+            if (averageMs < 100) head = "整体很快（平均 " + FormatMs(averageMs) + "）";
+            else if (averageMs < 300) head = "整体正常（平均 " + FormatMs(averageMs) + "）";
+            else if (averageMs < 1000) head = "整体偏慢（平均 " + FormatMs(averageMs) + "）";
+            else head = "整体很慢（平均 " + FormatMs(averageMs) + "）";
+
+            if (counts[3] > 0)
+            {
+                head += "；有 " + counts[3] + " 条 >= 1 s，优先看这几条";
+            }
+            else if (counts[2] > 0 && counts[2] * 10 >= total)
+            {
+                head += "；" + counts[2] + " 条落在 300 ms-1 s，值得顺手看下";
+            }
+            return head;
+        }
+
+        private static int PerformanceBucket(double ms)
+        {
+            if (ms < 100) return 0;
+            if (ms < 300) return 1;
+            if (ms < 1000) return 2;
+            return 3;
+        }
+
+        private static string FormatMs(double ms)
+        {
+            if (ms >= 10) return ms.ToString("0", CultureInfo.InvariantCulture) + " ms";
+            return ms.ToString("0.0", CultureInfo.InvariantCulture) + " ms";
         }
 
         private static string FormatPerformanceRequest(CurlRequest request, bool mask)
@@ -2561,9 +2661,6 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             buttons.Dock = DockStyle.Fill;
             buttons.Margin = new Padding(0, 0, 0, 4);
 
-            Button pasteButton = MakeSmallButton("从剪贴板粘贴", 118);
-            pasteButton.Click += delegate { PasteLogFromClipboard(); };
-
             Button analyzeButton = MakeSmallButton("开始分析", 88);
             analyzeButton.BackColor = PrimaryColor;
             analyzeButton.ForeColor = Color.White;
@@ -2588,7 +2685,6 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _logOnlyErrors.CheckedChanged += delegate { LogOptionsChanged(); };
             _logGroupTrace.CheckedChanged += delegate { LogOptionsChanged(); };
 
-            buttons.Controls.Add(pasteButton);
             buttons.Controls.Add(analyzeButton);
             buttons.Controls.Add(_logAiButton);
             buttons.Controls.Add(copyButton);
@@ -2733,11 +2829,12 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
         {
             if (_rootLayout == null || _tabs == null || _logPage == null) return;
             bool logActive = _tabs.SelectedTab == _logPage;
-            if (_curlSectionLabel != null) _curlSectionLabel.Visible = !logActive;
-            if (_inputBox != null) _inputBox.Visible = !logActive;
-            if (_curlToolbar != null) _curlToolbar.Visible = !logActive;
+            bool fullHeight = logActive || ActiveFeatureUsesFullHeight();
+            if (_curlSectionLabel != null) _curlSectionLabel.Visible = !fullHeight;
+            if (_inputBox != null) _inputBox.Visible = !fullHeight;
+            if (_curlToolbar != null) _curlToolbar.Visible = !fullHeight;
 
-            if (logActive)
+            if (fullHeight)
             {
                 _rootLayout.RowStyles[2].SizeType = SizeType.Absolute;
                 _rootLayout.RowStyles[2].Height = 0F;
@@ -2758,6 +2855,20 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
+            // 功能页优先处理自己的快捷键（Ctrl+Enter 执行 SQL/命令、F5 扫描、Ctrl+S 保存表格等），
+            // 未连接时也要吞掉这些键，避免误触发上方 curl 解析。
+            IAppFeaturePage activeFeaturePage = ActiveFeaturePage() as IAppFeaturePage;
+            if (activeFeaturePage != null)
+            {
+                if (activeFeaturePage.HandleShortcut(keyData)) return true;
+                if (keyData == (Keys.Control | Keys.Enter) || keyData == Keys.F5 ||
+                    keyData == (Keys.Control | Keys.F) || keyData == (Keys.Control | Keys.L) ||
+                    keyData == (Keys.Control | Keys.S))
+                {
+                    return true;
+                }
+            }
+
             if (keyData == (Keys.Control | Keys.Enter))
             {
                 if (_tabs != null && _logPage != null && _tabs.SelectedTab == _logPage)
@@ -2772,7 +2883,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
 
             // 剪贴板里是图片（例如微信截图）时，Ctrl+V 直接走 OCR；
             // 图片和文字同时存在时，只有在「截图识别」页签内才优先识别图片。
-            if (keyData == (Keys.Control | Keys.V) && _ocrPage != null)
+            if (keyData == (Keys.Control | Keys.V) && _ocrPage != null && activeFeaturePage == null)
             {
                 bool ocrTabActive = _tabs != null && _tabs.SelectedTab == _ocrPage;
                 bool hasImage = false;
@@ -2826,6 +2937,7 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             if (_resultBox != null && _resultBox.Focused) return _resultBox;
             if (_detailBox != null && _detailBox.Focused) return _detailBox;
             if (_failureBox != null && _failureBox.Focused) return _failureBox;
+            if (_performanceBox != null && _performanceBox.Focused) return _performanceBox;
             if (_ocrBox != null && _ocrBox.Focused) return _ocrBox;
             if (_logOutput != null && _logOutput.Focused) return _logOutput;
             return null;
@@ -3611,21 +3723,6 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             _logAiButton.Text = busy ? "AI 解读中…" : "AI 解读（联网）";
         }
 
-        private void PasteLogFromClipboard()
-        {
-            if (_logInput == null) return;
-            string text = GetClipboardText();
-            if (string.IsNullOrEmpty(text))
-            {
-                SetLogStatus("剪贴板里没有文本。先把日志复制一下再试。", ErrorColor);
-                return;
-            }
-            _logInput.Text = text;
-            _logInput.SelectionStart = 0;
-            _logInput.SelectionLength = 0;
-            StartLogAnalysis(false);
-        }
-
         private void CopyLogResult()
         {
             if (_logOutput == null || string.IsNullOrWhiteSpace(_logOutput.Text))
@@ -3670,7 +3767,11 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
                 return "日志页控件没有创建";
             }
             if (_logPage.Text != "日志翻译") return "日志页签名称不是「日志翻译」";
-            if (_tabs.TabPages.Count != 7) return "页签数量不是 7 个：" + _tabs.TabPages.Count;
+            if (_tabs.TabPages.Count != 8) return "页签数量不是 8 个：" + _tabs.TabPages.Count;
+            if (_databaseTab == null || _databasePage == null)
+                return "数据库页签没有创建";
+            if (_databaseTab.Text != "数据库排查") return "数据库页签名称不是「数据库排查」";
+            if (_tabs.TabPages[7] != _databaseTab) return "数据库页签位置不正确";
             if (_performancePage == null || _performanceBox == null ||
                 _failureAiPick == null || _failureAiButton == null)
             {
@@ -3829,6 +3930,23 @@ Cannot deserialize; nested exception is org.springframework.core.serializer.supp
             int slow120 = performance.IndexOf("120 ms", slowSection, StringComparison.Ordinal);
             if (slow2500 < 0 || slow120 < 0 || slow2500 > slow120)
                 return "性能页慢请求没有按耗时降序";
+
+            int slowestLine = performance.IndexOf("最慢: ", StringComparison.Ordinal);
+            if (slowestLine < 0 ||
+                performance.IndexOf(" ms", slowestLine, StringComparison.Ordinal) < 0)
+            {
+                return "性能页最慢请求没有显示耗时";
+            }
+            if (performance.Contains("中位") || performance.Contains("P95"))
+                return "性能页仍显示了中位数/P95";
+            if (performance.Contains("█"))
+                return "性能页耗时分布还在用全角方块，容易糊成一坨";
+            if (!performance.Contains("耗时分布") || !performance.Contains("参考线："))
+                return "性能页缺少耗时分布或快慢参考线";
+            if (!performance.Contains(">= 1000 ms") || !performance.Contains("100-300 ms"))
+                return "耗时分布的档位不正确";
+            if (!performance.Contains("判定："))
+                return "性能页缺少快慢判定";
 
             RefreshFailureChoices(_lastRequests);
             if (!_failureAiPick.Enabled || _failureAiPick.Items.Count != 1)
@@ -5435,6 +5553,8 @@ catch {
             catch (WebException ex)
             {
                 error = DescribeWebError(ex, settings.TimeoutSeconds);
+                // 配额 / 鉴权类错误重试多少次都一样，给调用方一个明确信号
+                if (IsFatalWebError(ex)) error = "FATAL:" + error;
                 return null;
             }
             catch (Exception ex)
@@ -5442,6 +5562,15 @@ catch {
                 error = "调用 AI 服务失败：" + ex.Message;
                 return null;
             }
+        }
+
+        // 令牌无效、无权限、额度用完这类错误不会因为重试而恢复
+        private static bool IsFatalWebError(WebException ex)
+        {
+            HttpWebResponse response = ex.Response as HttpWebResponse;
+            if (response == null) return false;
+            int status = (int)response.StatusCode;
+            return status == 401 || status == 402 || status == 403;
         }
 
         private static string DescribeWebError(WebException ex, int timeoutSeconds)
@@ -9597,6 +9726,11 @@ catch {
             return request;
         }
 
+        internal static string ReadContentForTest(Dictionary<string, object> content)
+        {
+            return ReadContent(content);
+        }
+
         private static string ReadContent(Dictionary<string, object> content)
         {
             string text = Str(content, "text");
@@ -9606,21 +9740,27 @@ catch {
             if (string.Equals(encoding, "base64", StringComparison.OrdinalIgnoreCase))
             {
                 string mimeType = Str(content, "mimeType");
-                if (LooksTextual(mimeType))
+                // 微信开发者工具会把已经解码好的明文也标成 base64，这时直接按 base64 解会得到乱码。
+                // 只有内容确实是 base64、且解的字节像文本时才解码，否则按原文显示。
+                byte[] decoded;
+                if (!TryDecodeBase64Text(text, out decoded))
                 {
-                    try
-                    {
-                        text = Encoding.UTF8.GetString(Convert.FromBase64String(text));
-                    }
-                    catch (Exception)
-                    {
-                        return "(base64 响应，解码失败)";
-                    }
+                    if (LooksTextual(mimeType)) return FitForDisplay(text);
+
+                    int declaredSize = 0;
+                    int.TryParse(Str(content, "size"), NumberStyles.Integer, CultureInfo.InvariantCulture, out declaredSize);
+                    string reason = "文件里标了 base64，但内容不是 base64（常见于微信开发者工具导出的 HAR）";
+                    if (declaredSize > 0 && text.Length > declaredSize * 4)
+                        reason = "文件里的内容不完整（只有 " + text.Length + " 个字符，声明大小约 " + declaredSize + " 字节）";
+                    return "(二进制响应 " + mimeType + "，" + text.Length + " 个字符，无法还原：" + reason + ")";
                 }
-                else
-                {
-                    return "(二进制响应 " + mimeType + "，" + text.Length + " 个 base64 字符)";
-                }
+
+                // 图片、字体这类资源不管解出来像不像文本，都只给提示；
+                // 其他二进制按可打印比例判断，避免把压缩数据当文本甩一屏乱码
+                bool resource = IsResourceMime(mimeType);
+                if (resource || (!LooksTextual(mimeType) && !IsMostlyPrintable(decoded)))
+                    return DescribeBinary(mimeType, decoded.Length);
+                text = Encoding.UTF8.GetString(decoded);
             }
 
             int originalLength = text.Length;
@@ -9629,6 +9769,88 @@ catch {
                 text = text.Substring(0, 100000) + "\r\n...（已截断，共 " + originalLength + " 字符）";
             }
             return text;
+        }
+
+        private static string DescribeBinary(string mimeType, int byteLength)
+        {
+            string kind = "二进制数据";
+            string mime = (mimeType ?? "").ToLowerInvariant();
+            if (mime.IndexOf("image") >= 0) kind = "图片";
+            else if (mime.IndexOf("font") >= 0) kind = "字体";
+            else if (mime.IndexOf("audio") >= 0) kind = "音频";
+            else if (mime.IndexOf("video") >= 0) kind = "视频";
+            return "(二进制响应 " + mimeType + "，" + byteLength + " 字节，属于" + kind + "，不做文本预览)";
+        }
+
+        private static bool IsResourceMime(string mimeType)
+        {
+            string mime = (mimeType ?? "").ToLowerInvariant();
+            if (mime.Length == 0) return false;
+            return mime.IndexOf("image") >= 0 || mime.IndexOf("font") >= 0 ||
+                   mime.IndexOf("audio") >= 0 || mime.IndexOf("video") >= 0;
+        }
+
+        // 内容是不是合法的 base64：长度、字符集和填充都要检查，
+        // 避免把本来就不是 base64 的明文（微信开发者工具导出的 HAR 常见）解成乱码。
+        private static bool TryDecodeBase64Text(string text, out byte[] bytes)
+        {
+            bytes = null;
+            string value = (text ?? "").Trim();
+            if (value.Length < 4 || value.Length % 4 != 0) return false;
+
+            int padding = 0;
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                          (ch >= '0' && ch <= '9') || ch == '+' || ch == '/';
+                if (ch == '=')
+                {
+                    // 填充只能出现在末尾，最多两个
+                    if (i < value.Length - 2) return false;
+                    padding++;
+                    if (padding > 2) return false;
+                    continue;
+                }
+                if (!ok || padding > 0) return false;
+            }
+
+            try
+            {
+                bytes = Convert.FromBase64String(value);
+                return true;
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+        }
+
+        // 字节里可打印的文本占多数才算“其实是文本”
+        private static bool IsMostlyPrintable(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0) return false;
+            int printable = 0;
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                byte b = bytes[i];
+                if (b == 0) return false;
+                if ((b >= 0x20 && b < 0x7F) || b == 9 || b == 10 || b == 13 || b >= 0x80) printable++;
+            }
+            return printable * 100 / bytes.Length >= 90;
+        }
+
+        // 文件里本来就解不开的文本：只保留可见字符，控制字符换成空格或说明，避免一屏乱码
+        private static string FitForDisplay(string text)
+        {
+            StringBuilder sb = new StringBuilder(text.Length);
+            for (int i = 0; i < text.Length; i++)
+            {
+                char ch = text[i];
+                if (ch == '\n' || ch == '\r' || ch == '\t' || ch >= ' ') sb.Append(ch);
+                else sb.Append('·');
+            }
+            return sb.ToString();
         }
 
         private static bool LooksTextual(string mimeType)

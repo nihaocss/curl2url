@@ -8,6 +8,8 @@
 
 以及一个**日志翻译助手**：把 Java / Spring / K8s / SQL 日志粘进来，自动去掉重复心跳和框架刷屏，翻译成「一句话 / 发生了什么 / 关键信息 / 有没有报错 / 建议下一步」的中文报告，不用先看懂英文堆栈。
 
+还带一个**数据库排查台**：直连 MySQL / Redis，浏览库表与 Key、执行查询、查看执行计划、编辑数据（需显式开启），并把 SQL、错误和结果预览交给 AI 分析。
+
 ## 下载安装
 
 - **Windows（推荐）**：直接下载 [curl2url.exe](https://github.com/nihaocss/curl2url/releases/latest/download/curl2url.exe)，免安装，双击运行。需要 Windows 10 / 11（.NET Framework 4.8 自带）。本地截图识别用的是系统自带 OCR，中文 Windows 默认已装 `zh-Hans-CN` 语言包，无需联网；想更准可以再配 AI 识别（可选，联网）。
@@ -30,7 +32,7 @@
 
 - 打开时如果剪贴板里是 cURL 或 HAR，会自动载入
 - **粘贴后自动解析**，不需要点按钮；`Ctrl+Enter` 可立即刷新。大 HAR 在后台解析，不会卡住窗口；解析中可点「取消解析」，继续编辑或粘贴后会自动解析最新内容
-- 界面七个页签：
+- 界面八个页签：
   - **URL**：提取出的地址（勾选「隐藏长参数 / Token」时，token 会打码）
   - **请求详情**：每个请求的 URL、方法、状态、查询参数、请求头、请求体（JSON 自动格式化）
   - **失败请求**：HAR 里状态码 ≥ 400、被拦截或无响应的请求，保留 URL、请求参数、响应头和响应体；选中一条后可点「AI 诊断（联网）」，让 AI 结合请求 / 响应给出失败原因和验证步骤
@@ -38,6 +40,7 @@
   - **响应**：仍可手动粘贴单条返回值，一键格式化 JSON
   - **截图识别**：微信 / QQ 截图后直接 `Ctrl+V`（或点「粘贴图片」「打开图片」，也可以把图片文件拖进窗口），自动识别报错文字；识别结果可一键复制给 AI。左侧缩略图**双击可放大**，支持缩放、拖动和 `Esc` 关闭
   - **日志翻译**：粘贴或拖入 `.log` / `.txt`，自动去噪并生成中文诊断报告；支持 `只看错误`、`按 traceId 分组`，也可选 `AI 解读（联网）`
+  - **数据库排查**：直连 MySQL / Redis，浏览表与 Key、执行查询、编辑数据、一键复制 / 导出结果；支持用中文让 AI 生成只读 SQL 并执行，也可对结果做 AI 分析；默认只读，写权限按连接单独开启
 - 右上角显示当前版本，并可「**检查更新**」（读取 GitHub 最新 Release，有新版本时可直接打开下载页；系统代理被 GitHub API 限流时会自动尝试直连和 Releases 页面）；「**使用教程**」解释开发者工具里各种 Copy 格式（Copy link address / request headers / response / as cURL / all as HAR 等）分别会复制到什么，以及该选哪个
 - URL / 请求详情 / 失败请求 / 性能上方有**筛选栏**：可按 URL 关键字、域名、HTTP 方法、状态码（2xx / 4xx / 5xx / 失败）组合过滤；关键字输入有 250ms 防抖，右侧显示「显示 N / M 个请求」。筛选只重绘结果，不会重新解析原始内容
 - 窗口位置、大小、是否最大化以及上次所在页签会保存到 `%APPDATA%\curl2url\ui-state.json`，下次启动恢复；如果显示器布局变了导致窗口跑出屏幕，会自动回退到默认位置
@@ -111,6 +114,47 @@
 
 AI 解读的提示词按资深 Java 后端 / 中间件 / SRE 的口径约束：先列事实，再写推断，推断必须带「很可能」和依据；区分 JDK 序列化与 JSON 解析问题；对 `ClassNotFound` 优先考虑 Redis 旧缓存 / 旧消息 / DTO 删除改名或 jar 缺类，而不是笼统归因于“字段不匹配”；最后给出可直接执行的排查命令。
 
+## 数据库排查台（MySQL / Redis）
+
+「数据库排查」页签可以直接连接 MySQL 和 Redis，不需要另外装客户端。连接配置只保存在本机，密码用 Windows DPAPI（当前用户）加密，文件位于 `%APPDATA%\curl2url\db-connections.json`；也可以用环境变量 `CURL2URL_DB_CONFIG` 指定配置路径。
+
+**连接管理**
+
+- 新建 / 编辑 / 删除连接，可先「测试连接」再保存
+- 连接和密码保存在本机（密码 DPAPI 加密），下次打开自动选中上次的连接记录；切到「数据库排查」页时自动重连上次使用的连接，并回到上次的库
+- 生产库不会自动连接，需要手动点「连接」
+- 支持环境标记：本地 / 测试 / 预发 / 生产；连接默认**只读**
+- 写权限按连接单独开启；生产环境开启写权限时，保存前必须手动输入「生产」二次确认
+
+**MySQL**
+
+- 左侧库表树，支持按表名搜索；单击库切换默认库，双击表加载数据
+- SQL 编辑器：`Ctrl+Enter` 或 `F5` 执行，`Esc` 取消；默认最多返回 500 行
+- 「解释」查看执行计划；查询结果和表数据都可一键「复制」，复制为含表头的 TSV，直接粘贴到 Excel / 飞书表格；也可导出 CSV
+- 「AI 查询」：不会写 SQL 时直接用中文描述需求，AI 按当前库的表名、字段名和字段注释生成一条只读 SQL，写进编辑器并执行；表多时会按问题关键词匹配表 / 字段注释，把相关表优先送进模型（「卡卷」这类常见错字也会按「卡券」匹配）；生成的 SQL 会再次经过只读闸门，写语句一律拦截
+- 「表数据」页：基于主键定位，支持新增行、删除行、单元格编辑、设为 NULL、保存 / 放弃更改；保存走事务，没有主键或视图不可编辑
+- 「表结构」页：字段、类型、可空、默认值、注释以及 `CREATE TABLE` 原文
+- 只读模式在会话级设置 `SET SESSION TRANSACTION READ ONLY`，客户端同时限制为单条只读语句；`FOR UPDATE`、`INTO OUTFILE`、多语句和服务器管理语句会被拒绝
+- 写模式也会拦截 `SET GLOBAL / SET PASSWORD / GRANT / KILL / SHUTDOWN` 等管理语句；无 `WHERE` 的 `UPDATE / DELETE` 和 DDL 会额外弹窗确认
+
+**Redis**
+
+- 支持密码、TLS、自签证书和 Cluster；连接后显示版本、节点数、`DBSIZE`、集群状态
+- 用 `SCAN` 分页遍历，不阻塞 Redis；支持匹配模式、继续扫描 / 重新开始，列表显示 Key、类型、TTL 和所在节点
+- 双击 Key 查看值：string、hash、list、set、zset、stream；大 Key 会截断并提示
+- 写权限开启后可修改字符串、设置 / 移除 TTL、重命名和删除 Key，每次写入都要确认
+- 命令控制台支持单条 Redis 命令，写命令需显式开启写权限；`FLUSHALL / FLUSHDB / CONFIG / EVAL / SCRIPT / SHUTDOWN / KEYS / MONITOR / SUBSCRIBE / MULTI` 等危险或阻塞命令始终禁用
+- Cluster 下会按 Key 槽位路由，并自动跟随 `MOVED / ASK` 重定向
+
+**AI 分析**
+
+- MySQL：对当前 SQL、错误、表结构和结果前 15 行做分析；Redis：对当前命令、Key 类型 / TTL 和值预览做分析
+- AI 查询只发送表名、字段名和字段注释，不发送数据行
+- 必须手动点击「AI 分析」/「AI 生成并执行」才会发送；发送前再次确认，敏感列 / Key 会先打码，不发送密码
+- 复用「截图识别 → AI 设置」里的服务商和 Key，不额外配置
+
+> 不要在生产库上直接试验删改。工具的安全限制是兜底，不是权限系统；数据库账号本身仍应遵循最小权限原则。
+
 ## 支持的格式
 
 - 一次粘贴**多条** curl（批量复制所有请求）
@@ -172,18 +216,36 @@ Get-Clipboard | node .\curl2url.js -s -n
 
 ## 重新编译（可选）
 
-不需要安装任何东西，用的是 Windows 自带的 .NET Framework 编译器：
+不需要安装 Visual Studio，用的是 Windows 自带的 .NET Framework 4.8 编译器。MySQL 驱动放在 `vendor/`，编译时作为引用并嵌入 exe，运行时仍然只有一个 exe：
 
 ```bat
-set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-%CSC% -target:exe -out:MakeIcon.exe -reference:System.Drawing.dll MakeIcon.cs
-MakeIcon.exe curl2url.ico
+build.cmd
+```
+
+`build.cmd` 等价于下面这条命令（在仓库根目录执行）：
+
+```bat
+set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 %CSC% -target:winexe -codepage:65001 -optimize+ -out:curl2url.exe ^
   -reference:System.Windows.Forms.dll -reference:System.Drawing.dll ^
-  -reference:System.Security.dll ^
+  -reference:System.Security.dll -reference:System.Data.dll ^
   -reference:"%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\System.Web.Extensions.dll" ^
-  -win32icon:curl2url.ico -win32manifest:curl2url.manifest Curl2UrlApp.cs
+  -reference:vendor\MySqlConnector.dll ^
+  -reference:vendor\System.Memory.dll -reference:vendor\System.Buffers.dll ^
+  -reference:vendor\System.Threading.Tasks.Extensions.dll ^
+  -reference:vendor\System.Runtime.CompilerServices.Unsafe.dll ^
+  -resource:vendor\MySqlConnector.dll,MySqlConnector.dll ^
+  -resource:vendor\System.Memory.dll,System.Memory.dll ^
+  -resource:vendor\System.Buffers.dll,System.Buffers.dll ^
+  -resource:vendor\System.Threading.Tasks.Extensions.dll,System.Threading.Tasks.Extensions.dll ^
+  -resource:vendor\System.Runtime.CompilerServices.Unsafe.dll,System.Runtime.CompilerServices.Unsafe.dll ^
+  -win32icon:curl2url.ico -win32manifest:curl2url.manifest ^
+  -recurse:src\*.cs Curl2UrlApp.cs
 ```
+
+注意：`-recurse` 必须用反斜杠路径 `src\*.cs`；写成 `src/*.cs` 时旧版 csc 会静默跳过子目录。编译完成后建议跑一次 `curl2url.exe --selftest`（无窗口、无网络，覆盖 SQL / Redis 安全闸门、CSV、DPAPI 和驱动加载）。`build.cmd` 会覆盖当前目录的 `curl2url.exe`，运行中的程序请先退出。
+
+架构说明见 [ARCHITECTURE.md](ARCHITECTURE.md)，第三方组件许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ## 注意
 
