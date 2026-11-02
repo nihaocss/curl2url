@@ -885,7 +885,12 @@ namespace Curl2Url
             else
             {
                 // 占位 / 提示 / 搜索结果标题
-                textColor = node.ForeColor == Color.Empty ? AppTheme.FaintColor : node.ForeColor;
+                bool faint = ReferenceEquals(node.Tag, PlaceholderTag) ||
+                    text.StartsWith("加载中", StringComparison.Ordinal) ||
+                    text.StartsWith("（没有表）", StringComparison.Ordinal) ||
+                    text.StartsWith("没有匹配的表", StringComparison.Ordinal);
+                textColor = faint ? AppTheme.FaintColor
+                    : (text.StartsWith("搜索结果：", StringComparison.Ordinal) ? AppTheme.PrimaryColor : node.ForeColor);
             }
 
             int textLeft = iconX + 22;
